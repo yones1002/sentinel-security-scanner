@@ -44,3 +44,49 @@ The development log commit is the commit that adds this file. Its hash is not wr
 - No findings, sandbox, or external security tools.
 - GitHub CLI is not installed here, so a pull request was not opened from this environment.
 - Remote `main` is still empty. Integration is on `develop`.
+
+## 2026-11-02 — PR 1 independent review
+
+The reviewed range is `5a9b12c1d3061330ae3ea101e87990a49bf9f0cf..014c8447ef7fad199628770088d27633caa50b43`. No product bug was found. Two suggestions were fixed in later commits. PR 2 has not been started.
+
+### Review result
+
+- `pyproject.toml`, the Typer command group, README, CHANGELOG, and the MIT license matched the approved PR 1 scope.
+- The version tests did not run the installed `sentinel` console script. A broken `[project.scripts]` entry point could still pass.
+- CI installed Ruff and did not run it. The existing Python 3.12 and 3.13 jobs were already green.
+
+### Fixes
+
+- `tests/test_version.py` runs the console script installed next to the current interpreter and strips `PYTHONPATH`.
+- `.github/workflows/ci.yml` checks `sentinel version` and `python -m sentinel version` against `sentinel.__version__`, then runs `python -m ruff check src tests`.
+
+### Tests
+
+Local interpreter: Python 3.13.7. Python 3.12 is not installed on this machine.
+
+```text
+ruff 0.17.3
+All checks passed!
+5 passed in 0.13s
+```
+
+`sentinel version` and `python -m sentinel version` printed `0.0.1`.
+
+GitHub Actions on `c6e6dd3db6760ae183e0d0b4f24ea32cddc5d519`, after these fixes:
+
+| Run | Branch | Result |
+| --- | --- | --- |
+| [41447429738](https://github.com/yones1002/sentinel-security-scanner/actions/runs/41447429738) | `develop` | success |
+| [41447403481](https://github.com/yones1002/sentinel-security-scanner/actions/runs/41447403481) | `feature/pr-1-package-skeleton` | success |
+
+On both runs, `test (3.12)` and `test (3.13)` completed with success. Install, entry-point check, Ruff, and pytest each succeeded.
+
+### Git
+
+| Commit | Hash |
+| --- | --- |
+| docs: record PR 1 in the development log | `014c8447ef7fad199628770088d27633caa50b43` |
+| test: exercise the installed sentinel console script | `90ae811009cab5c95ea607f392954dfce0ba125c` |
+| ci: check entry points and run Ruff | `c6e6dd3db6760ae183e0d0b4f24ea32cddc5d519` |
+
+This review entry is committed after those hashes. Its own hash is not written here.
