@@ -34,6 +34,26 @@ def test_version_command_prints_package_version() -> None:
     assert result.stdout == f"{__version__}\n"
 
 
+def test_installed_console_script_prints_package_version() -> None:
+    script_name = "sentinel.exe" if sys.platform == "win32" else "sentinel"
+    script = Path(sys.executable).parent / script_name
+    assert script.is_file(), (
+        "install this interpreter with 'pip install -e .' so the console script exists"
+    )
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+    completed = subprocess.run(
+        [str(script), "version"],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0
+    assert completed.stdout == f"{__version__}\n"
+    assert completed.stderr == ""
+
+
 def test_module_entrypoint_prints_package_version() -> None:
     completed = subprocess.run(
         [sys.executable, "-m", "sentinel", "version"],
