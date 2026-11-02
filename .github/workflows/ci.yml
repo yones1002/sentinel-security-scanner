@@ -18,5 +18,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install Sentinel and test tools
         run: python -m pip install -e ".[dev]"
+      - name: Check the installed entry points
+        run: |
+          test "$(sentinel version)" = "$(python -c 'import sentinel; print(sentinel.__version__)')"
+          test "$(python -m sentinel version)" = "$(python -c 'import sentinel; print(sentinel.__version__)')"
+      - name: Run Ruff
+        run: python -m ruff check src tests
       - name: Run pytest
         run: python -m pytest
