@@ -1,0 +1,2 @@
+<?php
+// CANARY_WP_CONFIG_SECRET
