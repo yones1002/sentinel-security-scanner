@@ -1,4 +1,4 @@
-"""Redaction of snippets, headers, and stored findings."""
+"""Redaction and the milestone-1 remediation template."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from sentinel.models import (
     Recommendation,
     Severity,
 )
+from sentinel.recommendations import PATTERN_DISCLAIMER, fallback_remediation
 from sentinel.redact import (
     HEADER_VALUE_LIMIT,
     SNIPPET_LIMIT,
@@ -62,7 +63,7 @@ def _finding(**overrides: object) -> Finding:
         "references": [],
         "scanner": "surface",
         "scanner_version": "0.0.1",
-        "false_positive_notes": "Pattern match only.",
+        "false_positive_notes": PATTERN_DISCLAIMER,
         "component_id": "apps/api",
     }
     payload.update(overrides)
@@ -195,6 +196,46 @@ def test_secret_text_is_masked_and_not_echoed() -> None:
     assert "QUJD" not in redacted.explanation
     assert "The rest of the explanation stays." in redacted.explanation
     assert SECRET not in redacted.model_dump_json()
+
+
+def test_pattern_disclaimer_is_the_milestone_1_sentence() -> None:
+    assert PATTERN_DISCLAIMER == (
+        "Pattern match only. The scanner did not execute the application. "
+        "A match can be in a test double, a migration, or dead code."
+    )
+
+
+def test_fallback_template_uses_one_redacted_sentence() -> None:
+    message = (
+        f'The tool said password = "{SECRET}". '
+        "Open the file and read the matched line."
+    )
+    fix = fallback_remediation(message, "apps/api/.env", None, "rule.one")
+    assert fix.what_is_wrong == fix.recommended_fix
+    assert SECRET not in fix.what_is_wrong
+    assert "Open the file and read the matched line." in fix.what_is_wrong
+    assert fix.why_dangerous == PATTERN_DISCLAIMER
+    assert fix.where == "apps/api/.env"
+    assert fix.secure_sketch is None
+    assert fix.sketch_language is None
+    assert fix.how_to_verify == (
+        "Re-run sentinel scan on this path and confirm rule "
+        "rule.one is absent for apps/api/.env."
+    )
+
+
+def test_fallback_with_a_line_and_a_long_message() -> None:
+    fix = fallback_remediation("m" * 240, "apps/api/app.py", 12, "rule.two")
+    assert fix.where == "apps/api/app.py:12"
+    assert fix.what_is_wrong == "m" * 200
+    assert fix.recommended_fix == fix.what_is_wrong
+    assert "rule.two" in fix.how_to_verify
+    assert fix.secure_sketch is None
+
+
+def test_fallback_rejects_an_empty_message() -> None:
+    with pytest.raises(ValueError, match="empty"):
+        fallback_remediation("", "apps/api/.env", 1, "rule.one")
 
 
 def test_redacted_finding_still_validates() -> None:
