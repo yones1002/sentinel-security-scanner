@@ -10,7 +10,7 @@
 | Analyzed targets | Other languages and frameworks, via plugins |
 | License target | MIT for Sentinel itself; third-party tools and any vendored rules keep their own licenses |
 
-This document is the implementation contract for milestone 1 and the architectural contract for later milestones. The product owner approved the architecture and the Key Decisions. The seven amendments in this revision are part of that approval. The nine open questions stay at the recommendations already written in this document. Those recommendations are working defaults, not new blockers. No Sentinel source tree exists yet. No scanner is implemented. Do not treat examples in this document as scan results from a real project. Sample CVE identifiers, rule hits, and line numbers are labeled fixtures.
+This document is the implementation contract for milestone 1 and the architectural contract for later milestones. The product owner approved the architecture and the Key Decisions. The seven amendments in this revision are part of that approval. The nine open questions stay at the recommendations already written in this document. Those recommendations are working defaults, not new blockers. The [dashboard supervision constraints](#dashboard-supervision-constraints) are also approved. They are specified, not implemented, and they are outside milestones 1–6. No scanner is implemented. Do not treat examples in this document as scan results from a real project. Sample CVE identifiers, rule hits, and line numbers are labeled fixtures.
 
 ---
 
@@ -147,7 +147,7 @@ Trusted boundaries:
 | Pinned base images already present locally, identified by digest at implementation time | Any start command suggested by the repository |
 | The Docker daemon, with the residual risk called out under [Risks](#10-main-architectural-risks-and-mitigations) | Optional `Explainer` text |
 
-There is no background service, no queue, and no multi-tenant API. Expected use is one developer or one CI job scanning one tree. Design load envelope for the Sentinel process itself, excluding the external tool:
+There is no background service, no queue, and no multi-tenant API. Expected use is one developer or one CI job scanning one tree. A future dashboard child process, if one is built, is a same-user supervisor for one job. It is not a sandbox and it is not a service. See [Dashboard supervision constraints](#dashboard-supervision-constraints). Design load envelope for the Sentinel process itself, excluding the external tool:
 
 - Trees up to 50,000 non-ignored files (`max_files`, default 50,000) or 20,000 entered directories (`max_directories`, default 20,000). Hitting either cap stops the walk, records one limitation, and still exits 0 or 3. It is not exit 2. The exact strings and the depth rule are in [Detection rules](#detection-rules).
 - Built-in surface scan target: under 5 seconds for 10,000 files of ordinary source size on a laptop. It `lstat`s and reads only the candidate set in the surface-scanner section, not every file. Content reads are capped at 1 MiB.
@@ -564,7 +564,7 @@ Contract:
 
 Shell-out adapters (Semgrep, Bandit, OSV-Scanner, Trivy) do not get a free pass. Before launch, if the walk recorded any `skipped symlink outside target` limitation, the adapter reads the pinned tool's `--help`. If that text has an option whose description says symlinks are not followed, the adapter passes that real option. If it does not, the adapter does not launch the tool: `ScannerSkip(failed=False, reason="tree contains a symlink that resolves outside the target and this <tool> build has no no-follow flag")`. Do not invent the flag name. After launch, every reported path is relativized. An absolute path whose resolved form is strictly inside the root becomes that relative path. A path `open_inside` would refuse (`../../etc/passwd`, or an absolute path outside the root) is dropped and counted. It never becomes a finding body. Sentinel cannot reach into the tool's address space. The pre-check plus the result drop is the control. If any reported path is refused, including when the no-follow flag was passed and the tool followed a link anyway, that invocation is a failed adapter: keep no findings from it, `ScannerSkip(failed=True, reason="tool reported a path outside the target")`, and limitation `dropped <n> tool paths outside target`. That is not a successful scan.
 
-Honest limitation, printed in the milestone 1 README and in `SECURITY.md`: `open_inside` confines Sentinel's own reads. It does not make an external process incapable of `open()` if that process is handed the directory and ignores flags. That case fails closed as the skip above.
+Honest limitation, printed in the milestone 1 README and in `SECURITY.md`: `open_inside` confines Sentinel's own reads. It does not make an external process incapable of `open()` if that process is handed the directory and ignores flags. That case fails closed as the skip above. A local path scan, including one started from a future dashboard, reads the operator's original tree. Semgrep, Bandit, OSV-Scanner, and Trivy still run with the current user's permissions. That dashboard path is not a sandbox. The same limit is restated in [Dashboard supervision constraints](#dashboard-supervision-constraints).
 
 Skip directory names `.git`, `node_modules`, `vendor`, `venv`, `.venv`, `dist`, `build`, `target`, `__pycache__`, `.tox`, `.eggs`. Also skip `bin` and `obj` only when that directory's parent contains a `*.csproj` or `*.sln`, so a Go `bin` directory is not skipped just for its name.
 
@@ -1473,6 +1473,7 @@ def should_reap(labels: dict[str, str], created_at: datetime, *, now: datetime) 
 - The app under test can still be hostile to the scanner process. Response handling stays in HTTPX with hard limits.
 - Sentinel will not detect every bug in the allowlisted framework command. `php artisan serve` runs the project's PHP inside the sandbox. That is the point of dynamic mode, and it is why the mount and capability policy exists.
 - No gVisor, Kata, or seccomp custom profile in milestone 4. A custom seccomp profile is easy to get wrong and is an open question, not a default.
+- The Docker sandbox is the isolation boundary for executing the project in dynamic path mode. A dashboard child process is not this sandbox. Static scans and website URL scans do not become sandboxed by running them under that child. See [Dashboard supervision constraints](#dashboard-supervision-constraints).
 
 ### 7. Development roadmap
 
@@ -1538,6 +1539,8 @@ Does not ship: HTML, SQLite, OSV, Trivy, Bandit, the Docker runner, URL fetching
 - `Explainer` protocol registered as `None`. No vendor SDK, no network call, no new finding path.
 - ZAP baseline remains unscheduled unless a separate design revision accepts the residual risk.
 - Portfolio polish: logo file if one exists by then, supported-tech table refreshed, `SECURITY.md` threat summary kept in sync with the runner.
+
+Milestones 1–6 do not include a dashboard. Any later dashboard is bound by [Dashboard supervision constraints](#dashboard-supervision-constraints). Those constraints do not schedule the dashboard and do not change the Docker sandbox used for dynamic path mode.
 
 ### 8. Initial dependency list
 
@@ -1640,6 +1643,7 @@ Fixture minimum set: `laravel_tiny`, `wordpress_tiny`, `wordpress_plugin_tiny`, 
 | 11 | Line-bucket fingerprints hide a real move or duplicate a shifted finding | Low | Documented in the compare output. Bucket width is 10, not 100, so identity is stable against formatting noise but not against large edits. |
 | 12 | Optional AI seam gets wired into detection later and starts inventing issues | Medium | `Explainer` is not called by `run_scan`. A test can assert the engine source does not reference `Explainer`. The protocol docstring forbids new findings. No SDK is in the dependency list, so adding one is a visible design change. |
 | 13 | ZAP or a future "just this once" active check expands scope | Medium | Active scan is a non-goal in this document. Adding it requires a design revision, not a plugin drop-in. CONTRIBUTING says a dynamic scanner calls `classify_request` before any socket. GET and HEAD are not automatically safe. `--confirm-ambiguous-reads` releases only `ambiguous` GET and HEAD. It does not release `state_changing`, a body, injection, brute force, or identifier iteration. |
+| 14 | A dashboard child process, a mode-`0700` intake directory, or a static or website scan is described as a sandbox | High | [Dashboard supervision constraints](#dashboard-supervision-constraints). The child is same-user job control. External tools keep the current user's permissions. Dynamic path mode keeps the Docker sandbox in section 6. |
 
 ---
 
@@ -1946,6 +1950,7 @@ Restated so implementers do not "complete" the feature with an attack corpus. A 
 ### Threats we accept
 
 - A determined local user can modify Sentinel's code. This is not an anti-tamper product.
+- A future dashboard child is the same user as the operator. It does not confine external tools. A directory created mode `0700` does not change that. Processes that leave the recorded session can survive cancellation. See [Dashboard supervision constraints](#dashboard-supervision-constraints).
 - A malicious dependency of Sentinel itself is a supply-chain risk, mitigated by a short dependency list and lockfiles, not by a custom updater.
 - Static analysis false negatives are the normal case, not a bug to paper over.
 
@@ -2020,6 +2025,42 @@ Flag uncertainty, collected in one place: do not hardcode an OSV offline flag, a
 
 ---
 
+## Dashboard supervision constraints
+
+Approved, specified, and not implemented. This section does not add a dashboard to milestones 1–6 and does not add a pull request. It binds any later local dashboard. It does not change scanner deadlines, `open_inside`, or the Docker sandbox.
+
+The dashboard child process exists to manage one job, to keep a scanner failure from being the dashboard process, and to request cancellation. It is not a security sandbox. Static scans and website URL scans stay host scans. They do not become sandboxed because a child process started them. Dynamic path mode, when it exists, still executes the project only in the Docker sandbox specified in section 6. URL mode still creates no Docker network.
+
+### Same-user file access
+
+A local path scan reads the operator's original project files. Sentinel does not substitute a copy or a different user. Semgrep, Bandit, OSV-Scanner, and Trivy run with the permissions of the current user. They can read what that user can read. `open_inside` still confines Sentinel's own reads. It still does not confine those external processes. Dropping a reported path that escapes the target remains the result control. It is not an operating-system file boundary.
+
+A first dashboard version may scan a ZIP only when the operator, for that archive, explicitly attests that they trust it. Sentinel does not decide trust by inspecting the archive. Without that attestation the dashboard refuses the scan. Until an operating-system isolation boundary for this path is itself specified and implemented, an archive the operator does not attest as trusted is out of scope and is not scanned.
+
+A private intake directory created with mode `0700` is ordinary permission bits for the same user. Other processes running as that user can still read and write it. Those bits are not security isolation, not a sandbox, and not a substitute for the missing operating-system boundary.
+
+### Cancellation
+
+Linux is the platform that guarantees this procedure. macOS has POSIX process groups, but it does not provide Linux `/proc` start-time identity or `PDEATHSIG`. macOS cancellation is best-effort and is not this guarantee. Windows is not guaranteed. `os.killpg` is not a Windows contract. No Windows cancellation guarantee is claimed until a later specification implements Windows Job Objects. This section does not implement those objects.
+
+The child installs a signal handler before it reports that the job is running. The parent sends `SIGTERM` only to that child pid, and only after that report. The handler records the cancellation request and returns. It must not leave the process on the default `SIGTERM` disposition, which would terminate it immediately. Cleanup runs on the child's main thread after the flag is observed. The child releases dashboard-owned resources and sends `SIGKILL` to every external scanner process group that this job started with `start_new_session=True` and whose recorded identity still matches. A tool can ignore `SIGTERM`, so the child's cleanup does not use `SIGTERM` for those groups. Scanner deadline handling is unchanged. On a scanner deadline the engine still sends `SIGKILL` with `os.killpg` to that scanner's process group.
+
+After sending `SIGTERM`, the parent waits at most 5 seconds. If the child or a recorded external group is still present, the parent sends `SIGKILL` only when the live process identity matches the identity stored before the process was allowed to run. On Linux that identity is the pid plus the start time from `/proc`. A pid whose start time differs is a reused pid. The parent does not signal it. `SIGKILL` cannot be handled. The 5 second wait is what bounds a child that has not returned to observe the flag, including a child blocked inside native code.
+
+Startup recovery uses the same identity check. It sends `SIGKILL` only when the stored identity still matches. If it does not match, recovery does not signal that pid. The job is still moved to a terminal failure state.
+
+Accepted limit: a process that calls `setsid` again, or that double-forks and lets the intermediate process exit, leaves the recorded process group. This procedure does not claim to kill it. The next startup still signals only a pid whose stored identity matches.
+
+### What this section does not claim
+
+- The child is not the section 6 sandbox.
+- Mode `0700` is not operating-system isolation.
+- A static scan is not a sandbox.
+- A website URL scan is not a sandbox.
+- Dynamic path mode does not move into the dashboard child.
+
+---
+
 ## Key Decisions
 
 1. **One engine, explicit plugins, no framework.** `run_scan` does not know about Laravel or Semgrep. `registry.py` is the only composition root. An event bus or a DI container would add indirection without a second caller.
@@ -2041,6 +2082,7 @@ Flag uncertainty, collected in one place: do not hardcode an OSV offline flag, a
 17. **GET and HEAD are not automatically safe.** The classifier runs before any socket. Classes are `read_candidate`, `ambiguous`, and `state_changing`. The default denies `ambiguous` and `state_changing`. `--confirm-ambiguous-reads` releases only `ambiguous` GET and HEAD. The report lists sent and withheld requests separately. A withhold is not a vulnerability finding.
 18. **The support matrix is the coverage claim.** Status words are `specified, not implemented` or `not planned in milestones 1–6`. Universal checks are listed once and are not copied onto every framework row. No scanner is implemented in this repository. `docs/supported-tech.md` and the README status table use those words.
 19. **Fingerprints are v1 canonical SHA-256.** Changing the canonical string is a new fingerprint version. Comparison across versions says `fingerprint versions differ: <baseline> vs <current>` and does not treat the digests as the same issue. Ambiguous ownership drops the finding. Duplicate component ids abort. Equal fingerprints are identity, not evidence equality. A cryptographic collision is not specially detected. 256-bit SHA-256 is the mitigation. The canonical string is stored nowhere except through the digest. Do not add a second hash.
+20. **A dashboard child is job control, not a sandbox.** It supervises one job, isolates a scanner crash from the dashboard process, and runs the cancellation procedure in [Dashboard supervision constraints](#dashboard-supervision-constraints). Static path scans read the original tree. Semgrep, Bandit, OSV-Scanner, and Trivy keep the current user's permissions. A first dashboard ZIP scan requires an explicit per-archive trust attestation from the operator. Sentinel does not infer that trust. A mode-`0700` intake directory is not isolation. Linux guarantees cancellation. macOS is best-effort. Windows has no guarantee until Job Objects are specified. A process that leaves the recorded session can survive. Dynamic path mode keeps the Docker sandbox. Static scans and website URL scans are not sandboxes.
 
 ---
 
