@@ -911,9 +911,13 @@ def test_registration_ceiling_and_empty_builtins() -> None:
                 _Registered("surface", frozenset({"static"}), 30),
             )
         )
-    assert builtin_scanners() == ()
     assert renderers() == ()
-    names = [scanner.name for scanner in builtin_scanners()]
+    registered = builtin_scanners()
+    assert [item.name for item in registered] == ["surface"]
+    assert registered[0].scope == ScannerScope.ROOT
+    assert registered[0].modes == frozenset({"static"})
+    assert registered[0].timeout_s == 60
+    names = [item.name for item in registered]
     assert len(names) == len(set(names))
 
 

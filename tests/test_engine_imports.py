@@ -74,7 +74,16 @@ def test_protocols_and_registry_stay_leaves() -> None:
     assert not any(_blocked(name, _ENGINE_BLOCKED) for name in protocols)
     assert "sentinel.sandbox.spec" not in protocols
     registry = _modules(SRC / "registry.py")
-    assert not any(_blocked(name, ("sentinel.scanners", "docker")) for name in registry)
+    allowed_scanners = {
+        "sentinel.scanners.surface",
+        "sentinel.scanners.surface.SurfaceScanner",
+    }
+    leaked_registry = [
+        name
+        for name in registry
+        if _blocked(name, ("sentinel.scanners", "docker")) and name not in allowed_scanners
+    ]
+    assert leaked_registry == []
     text = (SRC / "registry.py").read_text(encoding="utf-8")
     assert "entry_points" not in text
     assert "importlib" not in text
