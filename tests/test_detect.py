@@ -1102,5 +1102,35 @@ def test_detect_listing_without_nofollow_fails_closed(
     assert calls == []
 
 
+def test_pyproject_django_requires_a_dependency_table(tmp_path: Path) -> None:
+    negative = tmp_path / "negative"
+    negative.mkdir()
+    (negative / "pyproject.toml").write_text(
+        '[tool.coverage.report]\ndjango = "skip"\n',
+        encoding="utf-8",
+    )
+    skipped = detect(negative)
+    assert skipped.components[0].frameworks == ()
+    assert skipped.components[0].languages == (Language.PYTHON,)
+    positive = tmp_path / "positive"
+    positive.mkdir()
+    (positive / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["Django>=4.2"]\n',
+        encoding="utf-8",
+    )
+    found = detect(positive)
+    assert found.components[0].frameworks == (Framework.DJANGO,)
+    assert found.components[0].languages == (Language.PYTHON,)
+    assert found.components[0].evidence == ("pyproject.toml",)
+    poetry = tmp_path / "poetry"
+    poetry.mkdir()
+    (poetry / "pyproject.toml").write_text(
+        "[tool.poetry.dependencies]\ndjango = \"^4.2\"\n",
+        encoding="utf-8",
+    )
+    poet = detect(poetry)
+    assert poet.components[0].frameworks == (Framework.DJANGO,)
+
+
 def _by_id_tuple(components):
     return {component.component_id: component for component in components}

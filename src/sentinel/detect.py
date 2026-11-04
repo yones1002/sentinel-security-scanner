@@ -10,6 +10,7 @@ import json
 import os
 import re
 import stat
+import tomllib
 import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
@@ -485,7 +486,13 @@ def _match_python(walker: _Walker, node: _Node, built: _Built) -> None:
         text = _text(walker, _rel(node, name))
         if text is None:
             continue
-        matched = _python_frameworks(text)
+        if name == "pyproject.toml":
+            matched = _pyproject_frameworks(text)
+            if matched is None:
+                walker.limitations.append(f"manifest parse error: {_rel(node, name)}")
+                continue
+        else:
+            matched = _python_frameworks(text)
         if matched:
             found.update(matched)
             token_files.append(_rel(node, name))
@@ -731,6 +738,70 @@ def _dependency_keys(document: dict[str, object]) -> set[str]:
         if isinstance(block, dict):
             keys.update(key for key in block if isinstance(key, str))
     return keys
+
+
+def _pyproject_frameworks(text: str) -> set[Framework] | None:
+    """Frameworks named in pyproject dependency tables. None means invalid TOML."""
+    try:
+        document = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+    if not isinstance(document, dict):
+        return None
+    found: set[Framework] = set()
+    for name in _pyproject_dependency_names(document):
+        framework = _PY_NAMES.get(name)
+        if framework is not None:
+            found.add(framework)
+    return found
+
+
+def _pyproject_dependency_names(document: dict[str, object]) -> list[str]:
+    names: list[str] = []
+    project = document.get("project")
+    if isinstance(project, dict):
+        _collect_requirement_strings(project.get("dependencies"), names)
+        optional = project.get("optional-dependencies")
+        if isinstance(optional, dict):
+            for value in optional.values():
+                _collect_requirement_strings(value, names)
+    groups = document.get("dependency-groups")
+    if isinstance(groups, dict):
+        for value in groups.values():
+            _collect_requirement_strings(value, names)
+    tool = document.get("tool")
+    poetry = tool.get("poetry") if isinstance(tool, dict) else None
+    if isinstance(poetry, dict):
+        _collect_table_keys(poetry.get("dependencies"), names)
+        _collect_table_keys(poetry.get("dev-dependencies"), names)
+        group = poetry.get("group")
+        if isinstance(group, dict):
+            for value in group.values():
+                if isinstance(value, dict):
+                    _collect_table_keys(value.get("dependencies"), names)
+    return names
+
+
+def _collect_requirement_strings(value: object, names: list[str]) -> None:
+    if not isinstance(value, list):
+        return
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        parsed = _python_requirement_name(item)
+        if parsed is not None:
+            names.append(parsed)
+
+
+def _collect_table_keys(value: object, names: list[str]) -> None:
+    if not isinstance(value, dict):
+        return
+    for key in value:
+        if not isinstance(key, str):
+            continue
+        base = key.split("[", 1)[0].strip()
+        if base:
+            names.append(base)
 
 
 def _python_frameworks(text: str) -> set[Framework]:
