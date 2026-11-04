@@ -582,12 +582,19 @@ def test_depth_eight_keeps_the_directory_and_skips_its_children(tmp_path: Path) 
 
 def test_nested_unreadable_directory_is_a_limitation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     root = tmp_path / "tree"
-    (root / "blocked").mkdir(parents=True)
-    (root / "blocked" / "note.txt").write_text("hidden", encoding="utf-8")
+    blocked = root / "blocked"
+    blocked.mkdir(parents=True)
+    (blocked / "note.txt").write_text("hidden", encoding="utf-8")
     (root / "seen.txt").write_text("ok", encoding="utf-8")
+    blocked_id = (blocked.stat().st_dev, blocked.stat().st_ino)
     real = os.scandir
 
     def fake(path):
+        if isinstance(path, int):
+            info = os.fstat(path)
+            if (info.st_dev, info.st_ino) == blocked_id:
+                raise OSError("denied")
+            return real(path)
         if Path(path).name == "blocked":
             raise OSError("denied")
         return real(path)
@@ -990,6 +997,109 @@ def test_symlink_limitations_match_the_failure(
     assert denied.data is None
     assert denied.limitation == "permission denied: denied"
     assert b"hidden" not in (denied.limitation or "").encode()
+
+
+def test_detect_rejects_directory_inode_swap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    root = tmp_path / "scan"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "keep.txt").write_text("inside", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "go.mod").write_text("module OUTSIDE_CANARY_MODULE\n\ngo 1.22\n", encoding="utf-8")
+    (outside / "secret.txt").write_bytes(SECRET)
+    outside_id = (outside.stat().st_dev, outside.stat().st_ino)
+    real_lstat = os.lstat
+    real_scandir = os.scandir
+    swapped = {"done": False}
+    listed: list[tuple[int, int]] = []
+
+    def lstat(path, *args, dir_fd=None, **kwargs):
+        info = real_lstat(path, *args, dir_fd=dir_fd, **kwargs)
+        if (
+            swapped["done"]
+            or dir_fd is None
+            or path != "sub"
+            or not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+        ):
+            return info
+        swapped["done"] = True
+        os.rename(root / "sub", root / "sub.orig")
+        os.rename(outside, root / "sub")
+        return info
+
+    def scandir(path):
+        if isinstance(path, int):
+            info = os.fstat(path)
+            listed.append((info.st_dev, info.st_ino))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os, "scandir", scandir)
+    found = detect(root)
+    blob = repr(found)
+    assert swapped["done"] is True
+    assert outside_id not in listed
+    assert "OUTSIDE_CANARY_MODULE" not in blob
+    assert SECRET.decode() not in blob
+    assert "sub" not in {component.component_id for component in found.components}
+    assert "refused directory inode mismatch: sub" in found.limitations
+
+
+def test_detect_rejects_directory_symlink_swap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    root = tmp_path / "scan"
+    (root / "sub").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "go.mod").write_text("module OUTSIDE_CANARY_MODULE\n\ngo 1.22\n", encoding="utf-8")
+    (outside / "secret.txt").write_bytes(SECRET)
+    real_lstat = os.lstat
+    swapped = {"done": False}
+
+    def lstat(path, *args, dir_fd=None, **kwargs):
+        info = real_lstat(path, *args, dir_fd=dir_fd, **kwargs)
+        if (
+            swapped["done"]
+            or dir_fd is None
+            or path != "sub"
+            or not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+        ):
+            return info
+        swapped["done"] = True
+        os.rename(root / "sub", root / "sub.orig")
+        (root / "sub").symlink_to(outside, target_is_directory=True)
+        return info
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    found = detect(root)
+    blob = repr(found)
+    assert swapped["done"] is True
+    assert "OUTSIDE_CANARY_MODULE" not in blob
+    assert SECRET.decode() not in blob
+    assert str(outside) not in blob
+    assert "refused directory symlink: sub" in found.limitations
+    assert "sub" not in {component.component_id for component in found.components}
+
+
+def test_detect_listing_without_nofollow_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "scan"
+    root.mkdir()
+    (root / "go.mod").write_text("module SHOULD_NOT_LIST\n\ngo 1.22\n", encoding="utf-8")
+    calls: list[object] = []
+    real = os.scandir
+
+    def scandir(path):
+        calls.append(path)
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    monkeypatch.setattr("sentinel.fs.confined_directory_flags", lambda: None)
+    with pytest.raises(ScanFailure, match="target root cannot be listed"):
+        detect(root)
+    assert calls == []
 
 
 def _by_id_tuple(components):
