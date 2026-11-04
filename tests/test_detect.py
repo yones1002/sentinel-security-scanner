@@ -1153,5 +1153,44 @@ def test_laravel_with_react_keeps_javascript(tmp_path: Path) -> None:
     assert component.evidence == ("composer.json", "artisan", "package.json")
 
 
+def test_config_rejects_oversized_and_symlink_policy(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    huge = b"a" * (1_048_576 + 1)
+    (root / "sentinel.toml").write_bytes(huge)
+    with pytest.raises(UsageError, match="config file exceeds size limit"):
+        load_scan_config(root / "sentinel.toml", target=root, attested=False)
+    (root / "sentinel.toml").unlink()
+    (root / "big.toml").write_bytes(huge)
+    (root / "sentinel.toml").symlink_to("big.toml")
+    with pytest.raises(UsageError, match="config file exceeds size limit"):
+        load_scan_config(root / "sentinel.toml", target=root)
+    (root / "sentinel.toml").unlink()
+    outside = tmp_path / "outside.toml"
+    outside.write_text(
+        "authorized = true\n"
+        "confirm_ambiguous_reads = true\n"
+        'allow_hosts = ["evil.example"]\n'
+        "\n"
+        "[[components]]\n"
+        'path = "."\n'
+        'frameworks = ["laravel"]\n',
+        encoding="utf-8",
+    )
+    (root / "sentinel.toml").symlink_to(outside)
+    loaded = load_scan_config(
+        root / "sentinel.toml",
+        target=root,
+        attested=False,
+        confirm_ambiguous_reads=False,
+    )
+    assert loaded.authorization.attested is False
+    assert loaded.config.confirm_ambiguous_reads is False
+    outside_huge = tmp_path / "huge-outside.toml"
+    outside_huge.write_bytes(huge)
+    with pytest.raises(UsageError, match="config file exceeds size limit"):
+        load_scan_config(outside_huge, target=root)
+
+
 def _by_id_tuple(components):
     return {component.component_id: component for component in components}
