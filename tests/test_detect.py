@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import errno
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -861,6 +863,133 @@ def test_detect_does_not_open_files_except_through_open_inside() -> None:
         if attribute_call and node.func.attr in banned_attrs:
             banned.append(node.func.attr)
     assert banned == []
+
+
+def test_open_inside_rejects_inode_swap_without_reading(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "note.txt").write_bytes(b"safe-bytes")
+    secret = tmp_path / "secret.txt"
+    secret.write_bytes(SECRET)
+    seen: list[bytes] = []
+    real_lstat = os.lstat
+    real_read = os.read
+    swapped = {"done": False}
+
+    def lstat(path, *args, dir_fd=None, **kwargs):
+        info = real_lstat(path, *args, dir_fd=dir_fd, **kwargs)
+        if swapped["done"] or dir_fd is None or path != "note.txt" or not stat.S_ISREG(info.st_mode):
+            return info
+        swapped["done"] = True
+        target = root / "note.txt"
+        target.unlink()
+        os.link(secret, target)
+        return info
+
+    def read(fd, size):
+        block = real_read(fd, size)
+        seen.append(block)
+        return block
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os, "read", read)
+    opened = open_inside(root, "note.txt")
+    assert swapped["done"] is True
+    assert opened.data is None
+    assert opened.limitation == "refused inode mismatch: note.txt"
+    assert all(SECRET not in block for block in seen)
+    assert SECRET not in (opened.limitation or "").encode()
+
+
+def test_open_inside_rejects_directory_inode_swap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "root"
+    (root / "mid").mkdir(parents=True)
+    (root / "mid" / "note.txt").write_bytes(b"safe-bytes")
+    seen: list[bytes] = []
+    real_lstat = os.lstat
+    real_read = os.read
+    swapped = {"done": False}
+
+    def lstat(path, *args, dir_fd=None, **kwargs):
+        info = real_lstat(path, *args, dir_fd=dir_fd, **kwargs)
+        if (
+            swapped["done"]
+            or dir_fd is None
+            or path != "mid"
+            or not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+        ):
+            return info
+        swapped["done"] = True
+        live = root / "mid"
+        os.rename(live, root / "mid.orig")
+        live.mkdir()
+        (live / "note.txt").write_bytes(SECRET)
+        return info
+
+    def read(fd, size):
+        block = real_read(fd, size)
+        seen.append(block)
+        return block
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os, "read", read)
+    opened = open_inside(root, "mid/note.txt")
+    assert swapped["done"] is True
+    assert opened.data is None
+    assert opened.limitation == "refused inode mismatch: mid/note.txt"
+    assert all(SECRET not in block for block in seen)
+
+
+def test_symlink_limitations_match_the_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "real.txt").write_bytes(b"inside-ok")
+    (root / "missing-link").symlink_to("missing.txt")
+    broken = open_inside(root, "missing-link")
+    assert broken.data is None
+    assert broken.limitation == "skipped broken symlink: missing-link"
+    os.mkfifo(root / "pipe")
+    (root / "pipe-link").symlink_to("pipe")
+    unusual = open_inside(root, "pipe-link")
+    assert unusual.data is None
+    assert unusual.limitation == "refused non-regular file: pipe-link"
+    current = root / "hop0"
+    for index in range(7):
+        nxt = root / f"hop{index + 1}"
+        current.symlink_to(nxt.name)
+        current = nxt
+    current.symlink_to("real.txt")
+    assert open_inside(root, "hop0").data == b"inside-ok"
+    current = root / "long0"
+    for index in range(8):
+        nxt = root / f"long{index + 1}"
+        current.symlink_to(nxt.name)
+        current = nxt
+    current.symlink_to("real.txt")
+    limited = open_inside(root, "long0")
+    assert limited.data is None
+    assert limited.limitation == "refused symlink hop limit: long0"
+    (root / "hidden.txt").write_bytes(b"hidden")
+    (root / "denied").symlink_to("hidden.txt")
+    real_open = os.open
+
+    def deny(path, flags, *args, **kwargs):
+        if path == "hidden.txt" and not flags & os.O_DIRECTORY:
+            raise PermissionError(errno.EACCES, "denied", path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", deny)
+    denied = open_inside(root, "denied")
+    assert denied.data is None
+    assert denied.limitation == "permission denied: denied"
+    assert b"hidden" not in (denied.limitation or "").encode()
 
 
 def _by_id_tuple(components):
