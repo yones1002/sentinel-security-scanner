@@ -1132,5 +1132,26 @@ def test_pyproject_django_requires_a_dependency_table(tmp_path: Path) -> None:
     assert poet.components[0].frameworks == (Framework.DJANGO,)
 
 
+def test_laravel_with_react_keeps_javascript(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    root.mkdir()
+    (root / "composer.json").write_text(
+        '{"require": {"laravel/framework": "11.0.0"}}\n',
+        encoding="utf-8",
+    )
+    (root / "artisan").write_text("", encoding="utf-8")
+    (root / "package.json").write_text(
+        '{"dependencies": {"react": "18.2.0"}}\n',
+        encoding="utf-8",
+    )
+    found = detect(root)
+    component = found.components[0]
+    assert component.frameworks == (Framework.LARAVEL,)
+    assert Framework.REACT not in component.frameworks
+    assert component.languages == (Language.PHP, Language.JAVASCRIPT)
+    assert component.kind == ComponentKind.APPLICATION
+    assert component.evidence == ("composer.json", "artisan", "package.json")
+
+
 def _by_id_tuple(components):
     return {component.component_id: component for component in components}

@@ -606,25 +606,26 @@ def _match_rails(
 
 
 def _finish_node_languages(built: _Built) -> None:
-    ordered = _ordered(built.frameworks)
-    if Framework.EXPRESS in ordered:
+    """Record languages from every matched rule, then omit frontend frameworks."""
+    present = set(built.frameworks)
+    if Framework.EXPRESS in present:
         built.languages.add(Language.JAVASCRIPT)
         if built.tsconfig:
             built.languages.add(Language.TYPESCRIPT)
-    if Framework.NESTJS in ordered:
+    if Framework.NESTJS in present:
         built.languages.add(Language.TYPESCRIPT if built.tsconfig else Language.JAVASCRIPT)
-    if Framework.REACT in ordered or Framework.VUE in ordered:
+    if Framework.REACT in present or Framework.VUE in present:
         built.languages.add(Language.TYPESCRIPT if built.tsconfig else Language.JAVASCRIPT)
-    if Framework.ANGULAR in ordered:
+    if Framework.ANGULAR in present:
         built.languages.add(Language.TYPESCRIPT)
     if built.bare_package:
         built.languages.add(Language.JAVASCRIPT)
     if built.tsconfig and any(
-        item in ordered
+        item in present
         for item in (Framework.EXPRESS, Framework.NESTJS, Framework.REACT, Framework.VUE)
     ):
         _append_tsconfig(built)
-    built.frameworks = set(ordered)
+    built.frameworks = set(_ordered(present))
 
 
 def _append_tsconfig(built: _Built) -> None:
