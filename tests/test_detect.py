@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import errno
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -580,12 +582,19 @@ def test_depth_eight_keeps_the_directory_and_skips_its_children(tmp_path: Path) 
 
 def test_nested_unreadable_directory_is_a_limitation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     root = tmp_path / "tree"
-    (root / "blocked").mkdir(parents=True)
-    (root / "blocked" / "note.txt").write_text("hidden", encoding="utf-8")
+    blocked = root / "blocked"
+    blocked.mkdir(parents=True)
+    (blocked / "note.txt").write_text("hidden", encoding="utf-8")
     (root / "seen.txt").write_text("ok", encoding="utf-8")
+    blocked_id = (blocked.stat().st_dev, blocked.stat().st_ino)
     real = os.scandir
 
     def fake(path):
+        if isinstance(path, int):
+            info = os.fstat(path)
+            if (info.st_dev, info.st_ino) == blocked_id:
+                raise OSError("denied")
+            return real(path)
         if Path(path).name == "blocked":
             raise OSError("denied")
         return real(path)
@@ -861,6 +870,326 @@ def test_detect_does_not_open_files_except_through_open_inside() -> None:
         if attribute_call and node.func.attr in banned_attrs:
             banned.append(node.func.attr)
     assert banned == []
+
+
+def test_open_inside_rejects_inode_swap_without_reading(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "note.txt").write_bytes(b"safe-bytes")
+    secret = tmp_path / "secret.txt"
+    secret.write_bytes(SECRET)
+    seen: list[bytes] = []
+    real_lstat = os.lstat
+    real_read = os.read
+    swapped = {"done": False}
+
+    def lstat(path, *args, dir_fd=None, **kwargs):
+        info = real_lstat(path, *args, dir_fd=dir_fd, **kwargs)
+        if swapped["done"] or dir_fd is None or path != "note.txt" or not stat.S_ISREG(info.st_mode):
+            return info
+        swapped["done"] = True
+        target = root / "note.txt"
+        target.unlink()
+        os.link(secret, target)
+        return info
+
+    def read(fd, size):
+        block = real_read(fd, size)
+        seen.append(block)
+        return block
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os, "read", read)
+    opened = open_inside(root, "note.txt")
+    assert swapped["done"] is True
+    assert opened.data is None
+    assert opened.limitation == "refused inode mismatch: note.txt"
+    assert all(SECRET not in block for block in seen)
+    assert SECRET not in (opened.limitation or "").encode()
+
+
+def test_open_inside_rejects_directory_inode_swap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "root"
+    (root / "mid").mkdir(parents=True)
+    (root / "mid" / "note.txt").write_bytes(b"safe-bytes")
+    seen: list[bytes] = []
+    real_lstat = os.lstat
+    real_read = os.read
+    swapped = {"done": False}
+
+    def lstat(path, *args, dir_fd=None, **kwargs):
+        info = real_lstat(path, *args, dir_fd=dir_fd, **kwargs)
+        if (
+            swapped["done"]
+            or dir_fd is None
+            or path != "mid"
+            or not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+        ):
+            return info
+        swapped["done"] = True
+        live = root / "mid"
+        os.rename(live, root / "mid.orig")
+        live.mkdir()
+        (live / "note.txt").write_bytes(SECRET)
+        return info
+
+    def read(fd, size):
+        block = real_read(fd, size)
+        seen.append(block)
+        return block
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os, "read", read)
+    opened = open_inside(root, "mid/note.txt")
+    assert swapped["done"] is True
+    assert opened.data is None
+    assert opened.limitation == "refused inode mismatch: mid/note.txt"
+    assert all(SECRET not in block for block in seen)
+
+
+def test_symlink_limitations_match_the_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "real.txt").write_bytes(b"inside-ok")
+    (root / "missing-link").symlink_to("missing.txt")
+    broken = open_inside(root, "missing-link")
+    assert broken.data is None
+    assert broken.limitation == "skipped broken symlink: missing-link"
+    os.mkfifo(root / "pipe")
+    (root / "pipe-link").symlink_to("pipe")
+    unusual = open_inside(root, "pipe-link")
+    assert unusual.data is None
+    assert unusual.limitation == "refused non-regular file: pipe-link"
+    current = root / "hop0"
+    for index in range(7):
+        nxt = root / f"hop{index + 1}"
+        current.symlink_to(nxt.name)
+        current = nxt
+    current.symlink_to("real.txt")
+    assert open_inside(root, "hop0").data == b"inside-ok"
+    current = root / "long0"
+    for index in range(8):
+        nxt = root / f"long{index + 1}"
+        current.symlink_to(nxt.name)
+        current = nxt
+    current.symlink_to("real.txt")
+    limited = open_inside(root, "long0")
+    assert limited.data is None
+    assert limited.limitation == "refused symlink hop limit: long0"
+    (root / "hidden.txt").write_bytes(b"hidden")
+    (root / "denied").symlink_to("hidden.txt")
+    real_open = os.open
+
+    def deny(path, flags, *args, **kwargs):
+        if path == "hidden.txt" and not flags & os.O_DIRECTORY:
+            raise PermissionError(errno.EACCES, "denied", path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", deny)
+    denied = open_inside(root, "denied")
+    assert denied.data is None
+    assert denied.limitation == "permission denied: denied"
+    assert b"hidden" not in (denied.limitation or "").encode()
+
+
+def test_detect_rejects_directory_inode_swap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    root = tmp_path / "scan"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "keep.txt").write_text("inside", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "go.mod").write_text("module OUTSIDE_CANARY_MODULE\n\ngo 1.22\n", encoding="utf-8")
+    (outside / "secret.txt").write_bytes(SECRET)
+    outside_id = (outside.stat().st_dev, outside.stat().st_ino)
+    real_lstat = os.lstat
+    real_scandir = os.scandir
+    swapped = {"done": False}
+    listed: list[tuple[int, int]] = []
+
+    def lstat(path, *args, dir_fd=None, **kwargs):
+        info = real_lstat(path, *args, dir_fd=dir_fd, **kwargs)
+        if (
+            swapped["done"]
+            or dir_fd is None
+            or path != "sub"
+            or not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+        ):
+            return info
+        swapped["done"] = True
+        os.rename(root / "sub", root / "sub.orig")
+        os.rename(outside, root / "sub")
+        return info
+
+    def scandir(path):
+        if isinstance(path, int):
+            info = os.fstat(path)
+            listed.append((info.st_dev, info.st_ino))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os, "scandir", scandir)
+    found = detect(root)
+    blob = repr(found)
+    assert swapped["done"] is True
+    assert outside_id not in listed
+    assert "OUTSIDE_CANARY_MODULE" not in blob
+    assert SECRET.decode() not in blob
+    assert "sub" not in {component.component_id for component in found.components}
+    assert "refused directory inode mismatch: sub" in found.limitations
+
+
+def test_detect_rejects_directory_symlink_swap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    root = tmp_path / "scan"
+    (root / "sub").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "go.mod").write_text("module OUTSIDE_CANARY_MODULE\n\ngo 1.22\n", encoding="utf-8")
+    (outside / "secret.txt").write_bytes(SECRET)
+    real_lstat = os.lstat
+    swapped = {"done": False}
+
+    def lstat(path, *args, dir_fd=None, **kwargs):
+        info = real_lstat(path, *args, dir_fd=dir_fd, **kwargs)
+        if (
+            swapped["done"]
+            or dir_fd is None
+            or path != "sub"
+            or not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+        ):
+            return info
+        swapped["done"] = True
+        os.rename(root / "sub", root / "sub.orig")
+        (root / "sub").symlink_to(outside, target_is_directory=True)
+        return info
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    found = detect(root)
+    blob = repr(found)
+    assert swapped["done"] is True
+    assert "OUTSIDE_CANARY_MODULE" not in blob
+    assert SECRET.decode() not in blob
+    assert str(outside) not in blob
+    assert "refused directory symlink: sub" in found.limitations
+    assert "sub" not in {component.component_id for component in found.components}
+
+
+def test_detect_listing_without_nofollow_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "scan"
+    root.mkdir()
+    (root / "go.mod").write_text("module SHOULD_NOT_LIST\n\ngo 1.22\n", encoding="utf-8")
+    calls: list[object] = []
+    real = os.scandir
+
+    def scandir(path):
+        calls.append(path)
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    monkeypatch.setattr("sentinel.fs.confined_directory_flags", lambda: None)
+    with pytest.raises(ScanFailure, match="target root cannot be listed"):
+        detect(root)
+    assert calls == []
+
+
+def test_pyproject_django_requires_a_dependency_table(tmp_path: Path) -> None:
+    negative = tmp_path / "negative"
+    negative.mkdir()
+    (negative / "pyproject.toml").write_text(
+        '[tool.coverage.report]\ndjango = "skip"\n',
+        encoding="utf-8",
+    )
+    skipped = detect(negative)
+    assert skipped.components[0].frameworks == ()
+    assert skipped.components[0].languages == (Language.PYTHON,)
+    positive = tmp_path / "positive"
+    positive.mkdir()
+    (positive / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["Django>=4.2"]\n',
+        encoding="utf-8",
+    )
+    found = detect(positive)
+    assert found.components[0].frameworks == (Framework.DJANGO,)
+    assert found.components[0].languages == (Language.PYTHON,)
+    assert found.components[0].evidence == ("pyproject.toml",)
+    poetry = tmp_path / "poetry"
+    poetry.mkdir()
+    (poetry / "pyproject.toml").write_text(
+        "[tool.poetry.dependencies]\ndjango = \"^4.2\"\n",
+        encoding="utf-8",
+    )
+    poet = detect(poetry)
+    assert poet.components[0].frameworks == (Framework.DJANGO,)
+
+
+def test_laravel_with_react_keeps_javascript(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    root.mkdir()
+    (root / "composer.json").write_text(
+        '{"require": {"laravel/framework": "11.0.0"}}\n',
+        encoding="utf-8",
+    )
+    (root / "artisan").write_text("", encoding="utf-8")
+    (root / "package.json").write_text(
+        '{"dependencies": {"react": "18.2.0"}}\n',
+        encoding="utf-8",
+    )
+    found = detect(root)
+    component = found.components[0]
+    assert component.frameworks == (Framework.LARAVEL,)
+    assert Framework.REACT not in component.frameworks
+    assert component.languages == (Language.PHP, Language.JAVASCRIPT)
+    assert component.kind == ComponentKind.APPLICATION
+    assert component.evidence == ("composer.json", "artisan", "package.json")
+
+
+def test_config_rejects_oversized_and_symlink_policy(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    huge = b"a" * (1_048_576 + 1)
+    (root / "sentinel.toml").write_bytes(huge)
+    with pytest.raises(UsageError, match="config file exceeds size limit"):
+        load_scan_config(root / "sentinel.toml", target=root, attested=False)
+    (root / "sentinel.toml").unlink()
+    (root / "big.toml").write_bytes(huge)
+    (root / "sentinel.toml").symlink_to("big.toml")
+    with pytest.raises(UsageError, match="config file exceeds size limit"):
+        load_scan_config(root / "sentinel.toml", target=root)
+    (root / "sentinel.toml").unlink()
+    outside = tmp_path / "outside.toml"
+    outside.write_text(
+        "authorized = true\n"
+        "confirm_ambiguous_reads = true\n"
+        'allow_hosts = ["evil.example"]\n'
+        "\n"
+        "[[components]]\n"
+        'path = "."\n'
+        'frameworks = ["laravel"]\n',
+        encoding="utf-8",
+    )
+    (root / "sentinel.toml").symlink_to(outside)
+    loaded = load_scan_config(
+        root / "sentinel.toml",
+        target=root,
+        attested=False,
+        confirm_ambiguous_reads=False,
+    )
+    assert loaded.authorization.attested is False
+    assert loaded.config.confirm_ambiguous_reads is False
+    outside_huge = tmp_path / "huge-outside.toml"
+    outside_huge.write_bytes(huge)
+    with pytest.raises(UsageError, match="config file exceeds size limit"):
+        load_scan_config(outside_huge, target=root)
 
 
 def _by_id_tuple(components):

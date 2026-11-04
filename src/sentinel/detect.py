@@ -10,6 +10,7 @@ import json
 import os
 import re
 import stat
+import tomllib
 import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
@@ -17,7 +18,7 @@ from pathlib import Path
 
 from sentinel.config import ComponentOverride, DetectLimits
 from sentinel.errors import ScanFailure, UsageError
-from sentinel.fs import classify_symlink, open_inside
+from sentinel.fs import classify_symlink, open_confined_directory, open_inside
 from sentinel.models import Component, ComponentKind, Framework, Language
 
 _MANIFEST_BYTES = 1_048_576
@@ -64,6 +65,15 @@ _PY_NAMES = {
 _PY_MANIFESTS = ("pyproject.toml", "requirements.txt", "Pipfile")
 _PY_BARE = ("pyproject.toml", "requirements.txt", "setup.py", "Pipfile")
 _RAILS_GEM = re.compile(r"""gem\s*\(?\s*['"]rails['"]""")
+_LINK_TEXT = {
+    "broken": "skipped broken symlink: {path}",
+    "hop": "refused symlink hop limit: {path}",
+    "unusual": "refused non-regular file: {path}",
+    "permission": "permission denied: {path}",
+    "unreadable": "unreadable path: {path}",
+    "mismatch": "refused inode mismatch: {path}",
+    "unsupported": "unreadable path: {path}",
+}
 
 
 @dataclass(frozen=True)
@@ -233,54 +243,85 @@ class _Walker:
 
     def walk(self) -> list[_Node]:
         nodes: list[_Node] = []
-        pending: deque[tuple[str, int]] = deque([("", 0)])
+        try:
+            root_info = os.lstat(self.root)
+        except OSError as exc:
+            raise ScanFailure("target root cannot be listed") from exc
+        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+            raise ScanFailure("target root cannot be listed")
+        root_id = (root_info.st_dev, root_info.st_ino)
+        pending: deque[tuple[str, int, tuple[int, int]]] = deque([("", 0, root_id)])
         while pending and self.stopped is None:
-            rel, depth = pending.popleft()
+            rel, depth, expected = pending.popleft()
             if self.entered >= self.limits.max_directories:
                 self._stop("directory")
                 break
             self.entered += 1
-            directory = self.root if rel == "" else self.root.joinpath(*rel.split("/"))
-            try:
-                entries = _list_dir(os.fspath(directory))
-            except OSError as exc:
-                if rel == "":
-                    raise ScanFailure("target root cannot be listed") from exc
-                self.limitations.append(f"unreadable directory: {rel}")
-                self.nested_unreadable = True
+            fd, reason = open_confined_directory(self.root, rel, expected)
+            if fd is None:
+                self._directory_failure(rel, reason)
                 continue
-            node = _Node(rel)
-            nodes.append(node)
-            dotnet_parent = _has_dotnet_project(entries)
-            for entry in entries:
-                if self.stopped is not None:
-                    break
-                name = entry.name
-                if name in {"", ".", ".."}:
-                    continue
-                child = name if rel == "" else f"{rel}/{_nfc(name)}"
-                child = _nfc(child)
+            try:
                 try:
-                    info = os.lstat(entry.path)
-                except OSError:
-                    self.limitations.append(f"unreadable path: {child}")
+                    entries = _list_fd(fd)
+                except TypeError:
+                    self._directory_failure(rel, "unsupported")
                     continue
-                if stat.S_ISLNK(info.st_mode):
-                    self._symlink(node, entry, child)
+                except OSError as exc:
+                    self._directory_failure(rel, "unreadable", cause=exc)
                     continue
-                if stat.S_ISDIR(info.st_mode):
-                    node.names[name] = "dir"
-                    if name in _SKIP_DIRS or (name in {"bin", "obj"} and dotnet_parent):
+                node = _Node(rel)
+                nodes.append(node)
+                dotnet_parent = _has_dotnet_project(entries, fd)
+                for entry in entries:
+                    if self.stopped is not None:
+                        break
+                    name = entry.name
+                    if name in {"", ".", ".."}:
                         continue
-                    if depth >= _MAX_DEPTH:
-                        self._note_depth()
+                    child = name if rel == "" else f"{rel}/{_nfc(name)}"
+                    child = _nfc(child)
+                    try:
+                        info = os.lstat(name, dir_fd=fd)
+                    except OSError:
+                        self.limitations.append(f"unreadable path: {child}")
                         continue
-                    pending.append((child, depth + 1))
-                    continue
-                if not self._accept_file():
-                    break
-                node.names[name] = "file" if stat.S_ISREG(info.st_mode) else "other"
+                    if stat.S_ISLNK(info.st_mode):
+                        self._symlink(node, name, child, fd)
+                        continue
+                    if stat.S_ISDIR(info.st_mode):
+                        node.names[name] = "dir"
+                        if name in _SKIP_DIRS or (name in {"bin", "obj"} and dotnet_parent):
+                            continue
+                        if depth >= _MAX_DEPTH:
+                            self._note_depth()
+                            continue
+                        pending.append((child, depth + 1, (info.st_dev, info.st_ino)))
+                        continue
+                    if not self._accept_file():
+                        break
+                    node.names[name] = "file" if stat.S_ISREG(info.st_mode) else "other"
+            finally:
+                os.close(fd)
         return nodes
+
+    def _directory_failure(self, rel: str, reason: str, cause: BaseException | None = None) -> None:
+        if rel == "" or reason == "mismatch-root":
+            raise ScanFailure("target root cannot be listed") from cause
+        if reason == "symlink":
+            self.limitations.append(f"refused directory symlink: {rel}")
+            return
+        if reason == "mismatch":
+            self.limitations.append(f"refused directory inode mismatch: {rel}")
+        elif reason == "permission":
+            self.limitations.append(f"permission denied: {rel}")
+        elif reason == "unsupported":
+            self.limitations.append(
+                f"directory listing refused, no confined descriptor: {rel}"
+            )
+        else:
+            self.limitations.append(f"unreadable directory: {rel}")
+        self.nested_unreadable = True
 
     def note_symlink(self, relative: str) -> None:
         if relative in self._symlink_seen:
@@ -307,22 +348,31 @@ class _Walker:
         self._reads[relative] = opened.data
         return opened.data
 
-    def _symlink(self, node: _Node, entry: os.DirEntry[str], child: str) -> None:
+    def _symlink(self, node: _Node, name: str, child: str, dir_fd: int) -> None:
         kind = classify_symlink(self.root, child)
         if kind == "inside-dir":
-            node.names[entry.name] = "dir-symlink"
-            return
-        if kind != "inside-file":
-            self.note_symlink(child)
-            if _points_at_directory(entry):
-                node.names[entry.name] = "outside-symlink"
-                return
-        if not self._accept_file():
+            node.names[name] = "dir-symlink"
             return
         if kind == "inside-file":
-            node.names[entry.name] = "file-symlink"
+            if self._accept_file():
+                node.names[name] = "file-symlink"
             return
-        node.names[entry.name] = "outside-symlink"
+        if kind == "outside":
+            self.note_symlink(child)
+        else:
+            self._note_link_issue(child, kind)
+        if _points_at_directory(name, dir_fd):
+            node.names[name] = "outside-symlink"
+            return
+        if self._accept_file():
+            node.names[name] = "outside-symlink"
+
+    def _note_link_issue(self, relative: str, kind: str) -> None:
+        if relative in self._symlink_seen:
+            return
+        self._symlink_seen.add(relative)
+        template = _LINK_TEXT.get(kind, "unreadable path: {path}")
+        self.limitations.append(template.format(path=relative))
 
     def _accept_file(self) -> bool:
         if self.files_seen >= self.limits.max_files:
@@ -355,20 +405,20 @@ class _Walker:
         )
 
 
-def _list_dir(directory: str) -> list[os.DirEntry[str]]:
-    iterator = os.scandir(directory)
+def _list_fd(fd: int) -> list[os.DirEntry[str]]:
+    iterator = os.scandir(fd)
     try:
         return list(iterator)
     finally:
         iterator.close()
 
 
-def _has_dotnet_project(entries: list[os.DirEntry[str]]) -> bool:
+def _has_dotnet_project(entries: list[os.DirEntry[str]], dir_fd: int) -> bool:
     for entry in entries:
         if not (entry.name.endswith(".csproj") or entry.name.endswith(".sln")):
             continue
         try:
-            info = os.lstat(entry.path)
+            info = os.lstat(entry.name, dir_fd=dir_fd)
         except OSError:
             continue
         if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
@@ -376,11 +426,12 @@ def _has_dotnet_project(entries: list[os.DirEntry[str]]) -> bool:
     return False
 
 
-def _points_at_directory(entry: os.DirEntry[str]) -> bool:
+def _points_at_directory(name: str, dir_fd: int) -> bool:
     try:
-        return entry.is_dir(follow_symlinks=True)
+        info = os.stat(name, dir_fd=dir_fd, follow_symlinks=True)
     except OSError:
         return False
+    return stat.S_ISDIR(info.st_mode)
 
 
 def _match(walker: _Walker, node: _Node, nodes: dict[str, _Node]) -> _Built:
@@ -435,7 +486,13 @@ def _match_python(walker: _Walker, node: _Node, built: _Built) -> None:
         text = _text(walker, _rel(node, name))
         if text is None:
             continue
-        matched = _python_frameworks(text)
+        if name == "pyproject.toml":
+            matched = _pyproject_frameworks(text)
+            if matched is None:
+                walker.limitations.append(f"manifest parse error: {_rel(node, name)}")
+                continue
+        else:
+            matched = _python_frameworks(text)
         if matched:
             found.update(matched)
             token_files.append(_rel(node, name))
@@ -549,25 +606,26 @@ def _match_rails(
 
 
 def _finish_node_languages(built: _Built) -> None:
-    ordered = _ordered(built.frameworks)
-    if Framework.EXPRESS in ordered:
+    """Record languages from every matched rule, then omit frontend frameworks."""
+    present = set(built.frameworks)
+    if Framework.EXPRESS in present:
         built.languages.add(Language.JAVASCRIPT)
         if built.tsconfig:
             built.languages.add(Language.TYPESCRIPT)
-    if Framework.NESTJS in ordered:
+    if Framework.NESTJS in present:
         built.languages.add(Language.TYPESCRIPT if built.tsconfig else Language.JAVASCRIPT)
-    if Framework.REACT in ordered or Framework.VUE in ordered:
+    if Framework.REACT in present or Framework.VUE in present:
         built.languages.add(Language.TYPESCRIPT if built.tsconfig else Language.JAVASCRIPT)
-    if Framework.ANGULAR in ordered:
+    if Framework.ANGULAR in present:
         built.languages.add(Language.TYPESCRIPT)
     if built.bare_package:
         built.languages.add(Language.JAVASCRIPT)
     if built.tsconfig and any(
-        item in ordered
+        item in present
         for item in (Framework.EXPRESS, Framework.NESTJS, Framework.REACT, Framework.VUE)
     ):
         _append_tsconfig(built)
-    built.frameworks = set(ordered)
+    built.frameworks = set(_ordered(present))
 
 
 def _append_tsconfig(built: _Built) -> None:
@@ -681,6 +739,70 @@ def _dependency_keys(document: dict[str, object]) -> set[str]:
         if isinstance(block, dict):
             keys.update(key for key in block if isinstance(key, str))
     return keys
+
+
+def _pyproject_frameworks(text: str) -> set[Framework] | None:
+    """Frameworks named in pyproject dependency tables. None means invalid TOML."""
+    try:
+        document = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+    if not isinstance(document, dict):
+        return None
+    found: set[Framework] = set()
+    for name in _pyproject_dependency_names(document):
+        framework = _PY_NAMES.get(name)
+        if framework is not None:
+            found.add(framework)
+    return found
+
+
+def _pyproject_dependency_names(document: dict[str, object]) -> list[str]:
+    names: list[str] = []
+    project = document.get("project")
+    if isinstance(project, dict):
+        _collect_requirement_strings(project.get("dependencies"), names)
+        optional = project.get("optional-dependencies")
+        if isinstance(optional, dict):
+            for value in optional.values():
+                _collect_requirement_strings(value, names)
+    groups = document.get("dependency-groups")
+    if isinstance(groups, dict):
+        for value in groups.values():
+            _collect_requirement_strings(value, names)
+    tool = document.get("tool")
+    poetry = tool.get("poetry") if isinstance(tool, dict) else None
+    if isinstance(poetry, dict):
+        _collect_table_keys(poetry.get("dependencies"), names)
+        _collect_table_keys(poetry.get("dev-dependencies"), names)
+        group = poetry.get("group")
+        if isinstance(group, dict):
+            for value in group.values():
+                if isinstance(value, dict):
+                    _collect_table_keys(value.get("dependencies"), names)
+    return names
+
+
+def _collect_requirement_strings(value: object, names: list[str]) -> None:
+    if not isinstance(value, list):
+        return
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        parsed = _python_requirement_name(item)
+        if parsed is not None:
+            names.append(parsed)
+
+
+def _collect_table_keys(value: object, names: list[str]) -> None:
+    if not isinstance(value, dict):
+        return
+    for key in value:
+        if not isinstance(key, str):
+            continue
+        base = key.split("[", 1)[0].strip()
+        if base:
+            names.append(base)
 
 
 def _python_frameworks(text: str) -> set[Framework]:

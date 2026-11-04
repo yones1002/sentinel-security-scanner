@@ -12,6 +12,8 @@ from sentinel.fs import open_inside
 from sentinel.models import Framework
 
 _FAIL_ON = frozenset({"critical", "high", "medium", "low", "informational", "none"})
+# Same ceiling as a manifest read. Over-cap input is refused with no partial parse.
+_CONFIG_MAX_BYTES = 1_048_576
 _IGNORED_IN_REPO = (
     "authorized",
     "allow_hosts",
@@ -147,8 +149,10 @@ def load_scan_config(
 def _read_config(config_path: Path, target: Path | None) -> tuple[dict[str, object], bool]:
     if target is not None and _is_inside(config_path, target):
         relative = config_path.resolve().relative_to(target.resolve()).as_posix()
-        opened = open_inside(target.resolve(), relative)
+        opened = open_inside(target.resolve(), relative, max_bytes=_CONFIG_MAX_BYTES)
         if opened.data is None:
+            if opened.limitation and opened.limitation.startswith("read skipped"):
+                raise UsageError("config file exceeds size limit")
             raise UsageError("config file cannot be read")
         try:
             parsed = tomllib.loads(opened.data.decode("utf-8"))
@@ -158,7 +162,7 @@ def _read_config(config_path: Path, target: Path | None) -> tuple[dict[str, obje
             raise UsageError("malformed config")
         return parsed, True
     try:
-        raw = config_path.read_bytes()
+        raw = _read_bounded(config_path)
     except OSError as exc:
         raise UsageError("config file cannot be read") from exc
     try:
@@ -168,6 +172,15 @@ def _read_config(config_path: Path, target: Path | None) -> tuple[dict[str, obje
     if not isinstance(parsed, dict):
         raise UsageError("malformed config")
     return parsed, False
+
+
+def _read_bounded(path: Path) -> bytes:
+    """Read an outside config up to the cap. A longer file is not parsed."""
+    with path.open("rb") as handle:
+        data = handle.read(_CONFIG_MAX_BYTES + 1)
+    if len(data) > _CONFIG_MAX_BYTES:
+        raise UsageError("config file exceeds size limit")
+    return data
 
 
 def _is_inside(path: Path, target: Path) -> bool:
