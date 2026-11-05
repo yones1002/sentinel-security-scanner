@@ -41,6 +41,8 @@ from sentinel.recommendations import fallback_remediation, recommendation_for
 from sentinel.redact import redact_snippet
 
 _CONTENT_MAX = 1_048_576
+_PATH_MAX = 1024
+_PATH_SKIP = "surface skipped a path longer than 1024 characters"
 _MAX_DEPTH = 8
 _ENV = "sentinel.surface.env-file"
 _KEY = "sentinel.surface.private-key-filename"
@@ -318,6 +320,8 @@ def _file(state: _Walk, fd: int, rel: str, name: str, child: str) -> None:
 
 
 def _emit(state: _Walk, child: str, mode: int, rules: tuple[str, ...]) -> None:
+    if not _path_ok(state, child):
+        return
     reading = any(rule in _NEEDLES for rule in rules)
     opened = open_inside(state.root, child, max_bytes=_CONTENT_MAX if reading else 0)
     place = _placement(opened.limitation, opened.data is not None, reading=reading)
@@ -356,11 +360,33 @@ def _emit_literals(state: _Walk, child: str, data: bytes, rules: tuple[str, ...]
         snippet = redact_snippet(line)
         if snippet is None or snippet == "":
             continue
-        state.findings.append(_finding(rule, child, line=number, snippet=snippet, name=needle))
+        _keep(state, _finding(rule, child, line=number, snippet=snippet, name=needle))
 
 
 def _emit_name(state: _Walk, child: str, rule: str, name: str) -> None:
-    state.findings.append(_finding(rule, child, line=None, snippet=None, name=name))
+    if not _path_ok(state, child):
+        return
+    _keep(state, _finding(rule, child, line=None, snippet=None, name=name))
+
+
+def _path_ok(state: _Walk, child: str) -> bool:
+    """Reject a relative path the finding model cannot store.
+
+    ``Location.path`` allows 1024 characters. A longer candidate must not be
+    read and must not abort the rest of the scan.
+    """
+
+    if len(child) <= _PATH_MAX:
+        return True
+    state.note(_PATH_SKIP)
+    return False
+
+
+def _keep(state: _Walk, found: Finding | None) -> None:
+    if found is None:
+        state.note(_PATH_SKIP)
+        return
+    state.findings.append(found)
 
 
 def _placement(limitation: str | None, has_data: bool, *, reading: bool) -> str:
@@ -422,7 +448,9 @@ def _finding(
     line: int | None,
     snippet: str | None,
     name: str,
-) -> Finding:
+) -> Finding | None:
+    if len(path) > _PATH_MAX:
+        return None
     title, explanation, summary, notes, references, severity, confidence, kind = _FACE[rule]
     if rule == _ENV:
         explanation = f"A file named {name} was found. Contents were not read or stored."
