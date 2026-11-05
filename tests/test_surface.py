@@ -16,9 +16,14 @@ from sentinel.config import Authorization, DetectLimits, load_scan_config
 from sentinel.detect import _SKIP_DIRS
 from sentinel.engine import run_scan
 from sentinel.fingerprint import fingerprint
+from sentinel.fs import open_inside
 from sentinel.models import Component, ComponentKind
 from sentinel.protocols import ComponentScanTarget, ScanContext, ScanMode
-from sentinel.recommendations import recommendation_for
+from sentinel.recommendations import (
+    PATTERN_DISCLAIMER,
+    fallback_remediation,
+    recommendation_for,
+)
 from sentinel.registry import builtin_scanners, renderers
 from sentinel.sandbox.unavailable import UnavailableDynamicRuntime
 from sentinel.scanners.surface import SKIP_DIRECTORY_NAMES, SurfaceScanner
@@ -129,6 +134,12 @@ def test_recommendation_rows_have_no_sketches() -> None:
         assert row.what_is_wrong
         assert row.recommended_fix
     assert recommendation_for("sentinel.semgrep.example", None) is None
+    fallback = fallback_remediation("password=hunter2", "apps/api/.env", None, "sentinel.example")
+    assert fallback.what_is_wrong == "password=***"
+    assert fallback.recommended_fix == "password=***"
+    assert fallback.why_dangerous == PATTERN_DISCLAIMER
+    assert fallback.secure_sketch is None
+    assert fallback.where == "apps/api/.env"
     root = Path(__file__).resolve().parents[1]
     text = (root / "src/sentinel/recommendations.py").read_text(encoding="utf-8")
     text += (root / "src/sentinel/scanners/surface.py").read_text(encoding="utf-8")
@@ -174,6 +185,9 @@ def test_monorepo_env_is_stamped_by_the_engine(tmp_path: Path) -> None:
     )
     assert [item.component_id for item in direct.findings] == ["."]
     assert [item.location.path for item in direct.findings] == ["apps/api/.env"]
+    assert direct.findings[0].fingerprint != fingerprint(
+        direct.findings[0].model_copy(update={"component_id": "apps/api"})
+    )
     found = _by_rule(report, ENV)
     assert len(found) == 1
     item = found[0]
@@ -441,6 +455,119 @@ def test_non_posix_skips_world_writable(tmp_path: Path, monkeypatch: pytest.Monk
     assert [item.evidence.rule_id for item in report.findings] == [ENV]
     assert _by_rule(report, WW) == []
     assert report.limitations.count(POSIX_SKIP) == 1
+
+
+def _rel_of_length(total: int, leaf: str) -> str:
+    prefix = "/".join(["p" * 200] * 4)
+    pad = total - (len(prefix) + 2 + len(leaf))
+    assert 1 <= pad <= 255
+    relative = prefix + "/" + ("q" * pad) + "/" + leaf
+    assert len(relative) == total
+    assert relative.count("/") <= 8
+    return relative
+
+
+def test_overlong_path_does_not_abort_or_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+
+    def spy(root: Path, candidate: str, max_bytes: int | None = None):
+        seen.append(candidate)
+        return open_inside(root, candidate, max_bytes)
+
+    monkeypatch.setattr("sentinel.scanners.surface.open_inside", spy)
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write(root, ".env", "visible\n")
+    long_env = _rel_of_length(1025, ".env")
+    _write(root, long_env, f"{CANARY}=placeholder\npassword=SuperSecretValue99\n")
+    long_manifest = _rel_of_length(1025, "app.yaml")
+    long_manifest = long_manifest.rsplit("/", 1)[0] + "/k8s/app.yaml"
+    assert len(long_manifest) > 1024
+    assert long_manifest.count("/") <= 8
+    _write(root, long_manifest, f"hostNetwork: true {CANARY}\npassword=SuperSecretValue99\n")
+    boundary = _rel_of_length(1024, ".env.local")
+    _write(root, boundary, f"{CANARY}=placeholder\n")
+    _ctx, report = _scan(root)
+    assert report.scanners.executed[0].status == "executed"
+    assert ".env" in [item.location.path for item in _by_rule(report, ENV)]
+    assert boundary in [item.location.path for item in _by_rule(report, ENV)]
+    assert long_env not in [item.location.path for item in report.findings]
+    assert long_manifest not in [item.location.path for item in report.findings]
+    assert _by_rule(report, K8S) == []
+    assert "surface skipped a path longer than 1024 characters" in report.limitations
+    assert long_env not in seen
+    assert long_manifest not in seen
+    assert boundary in seen
+    blob = report.model_dump_json()
+    assert CANARY not in blob
+    assert "SuperSecretValue99" not in blob
+
+
+def test_symlink_chains_do_not_escape_the_root(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write(root, ".env", "keep\n")
+    outside = tmp_path / "outside-compose.yml"
+    outside.write_text(
+        f"{CANARY}\npassword=SuperSecretValue99\ndocker.sock\nprivileged: true\n",
+        encoding="utf-8",
+    )
+    (root / "mid.yml").symlink_to(outside)
+    (root / "compose.yml").symlink_to(root / "mid.yml")
+    hidden = root / "hidden"
+    hidden.mkdir()
+    _write(hidden, "app.yaml", f"hostNetwork: true {CANARY}\npassword=SuperSecretValue99\n")
+    (root / "k8s").symlink_to(hidden, target_is_directory=True)
+    nested = root / "sub"
+    nested.mkdir()
+    (nested / ".env").symlink_to(Path("..") / ".." / outside.name)
+    sibling = tmp_path / "repo-secret"
+    sibling.mkdir()
+    _write(sibling, "compose.yaml", f"privileged: true {CANARY}\n")
+    (root / "compose.yaml").symlink_to(sibling / "compose.yaml")
+    _ctx, report = _scan(root)
+    assert [item.location.path for item in report.findings] == [".env"]
+    blob = report.model_dump_json()
+    assert CANARY not in blob
+    assert "SuperSecretValue99" not in blob
+    assert "docker.sock" not in blob
+    assert str(outside) not in blob
+    assert str(sibling) not in blob
+    assert "skipped symlink outside target: compose.yml" in report.limitations
+    assert "skipped symlink outside target: compose.yaml" in report.limitations
+    assert "skipped symlink outside target: sub/.env" in report.limitations
+
+
+def test_undecodable_and_adjacent_lines_are_not_stored(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "compose.yml").write_bytes(
+        f"{CANARY}\npassword=SuperSecretValue99\n".encode() + b"\xff" + b"docker.sock\n"
+    )
+    (root / "id_rsa").write_bytes(
+        b"-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        + CANARY.encode()
+        + b"\n-----END OPENSSH PRIVATE KEY-----\n"
+    )
+    _write(
+        root,
+        "compose.yaml",
+        f"{CANARY}=placeholder\nprivileged: true password=SuperSecretValue99\n"
+        "token=SuperSecretValue99\n",
+    )
+    _ctx, report = _scan(root)
+    assert _by_rule(report, SOCK) == []
+    privileged = _by_rule(report, PRIV)
+    assert len(privileged) == 1
+    assert privileged[0].evidence.snippet == "privileged: true password=***"
+    assert privileged[0].location.line == 2
+    key = _by_rule(report, KEY)
+    assert [item.location.path for item in key] == ["id_rsa"]
+    assert key[0].evidence.snippet is None
+    blob = report.model_dump_json()
+    assert CANARY not in blob
+    assert "SuperSecretValue99" not in blob
+    assert "BEGIN OPENSSH PRIVATE KEY" not in blob
 
 
 def test_surface_ast_does_not_open_files_or_import_tools() -> None:
