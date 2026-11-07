@@ -97,7 +97,7 @@ def test_skip_names_match_the_detector() -> None:
 def test_registry_is_surface_only() -> None:
     scanners = builtin_scanners()
     assert [item.name for item in scanners] == ["surface"]
-    assert renderers() == ()
+    assert [item.format_id for item in renderers()] == ["json", "markdown"]
     scanner = scanners[0]
     assert scanner.version == __version__
     assert scanner.rule_pack_version == "surface-1"

@@ -911,7 +911,7 @@ def test_registration_ceiling_and_empty_builtins() -> None:
                 _Registered("surface", frozenset({"static"}), 30),
             )
         )
-    assert renderers() == ()
+    assert [item.format_id for item in renderers()] == ["json", "markdown"]
     registered = builtin_scanners()
     assert [item.name for item in registered] == ["surface"]
     assert registered[0].scope == ScannerScope.ROOT
