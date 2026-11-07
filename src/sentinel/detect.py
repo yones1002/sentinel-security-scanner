@@ -39,6 +39,8 @@ _SKIP_DIRS = frozenset(
         ".eggs",
     }
 )
+# Real directory names the matchers read even when that child is not entered.
+_MARKER_DIRS = frozenset({"wp-includes", "wp-content"})
 _FRONTEND = frozenset({Framework.REACT, Framework.VUE, Framework.ANGULAR})
 _FRAMEWORK_ORDER = (
     Framework.LARAVEL,
@@ -240,6 +242,7 @@ class _Walker:
         self.symlink_total = 0
         self._symlink_seen: set[str] = set()
         self._reads: dict[str, bytes | None] = {}
+        self._directory_overflow = False
 
     def walk(self) -> list[_Node]:
         nodes: list[_Node] = []
@@ -263,7 +266,9 @@ class _Walker:
                 continue
             try:
                 try:
-                    entries = _list_fd(fd)
+                    # The project file may appear after bin or obj in readdir order.
+                    # This pass keeps only a boolean so the listing is not retained.
+                    dotnet_parent = _directory_has_dotnet_project(fd)
                 except TypeError:
                     self._directory_failure(rel, "unsupported")
                     continue
@@ -272,38 +277,104 @@ class _Walker:
                     continue
                 node = _Node(rel)
                 nodes.append(node)
-                dotnet_parent = _has_dotnet_project(entries, fd)
-                for entry in entries:
-                    if self.stopped is not None:
-                        break
-                    name = entry.name
-                    if name in {"", ".", ".."}:
-                        continue
-                    child = name if rel == "" else f"{rel}/{_nfc(name)}"
-                    child = _nfc(child)
-                    try:
-                        info = os.lstat(name, dir_fd=fd)
-                    except OSError:
-                        self.limitations.append(f"unreadable path: {child}")
-                        continue
-                    if stat.S_ISLNK(info.st_mode):
-                        self._symlink(node, name, child, fd)
-                        continue
-                    if stat.S_ISDIR(info.st_mode):
-                        node.names[name] = "dir"
-                        if name in _SKIP_DIRS or (name in {"bin", "obj"} and dotnet_parent):
-                            continue
-                        if depth >= _MAX_DEPTH:
-                            self._note_depth()
-                            continue
-                        pending.append((child, depth + 1, (info.st_dev, info.st_ino)))
-                        continue
-                    if not self._accept_file():
-                        break
-                    node.names[name] = "file" if stat.S_ISREG(info.st_mode) else "other"
+                try:
+                    self._read_entries(fd, node, rel, depth, dotnet_parent, pending)
+                except TypeError:
+                    self._directory_failure(rel, "unsupported")
+                except OSError as exc:
+                    self._directory_failure(rel, "unreadable", cause=exc)
             finally:
                 os.close(fd)
+        if self.stopped is None and self._directory_overflow:
+            self._stop("directory")
         return nodes
+
+    def _read_entries(
+        self,
+        fd: int,
+        node: _Node,
+        rel: str,
+        depth: int,
+        dotnet_parent: bool,
+        pending: deque[tuple[str, int, tuple[int, int]]],
+    ) -> None:
+        """Consume one directory in readdir order without retaining it.
+
+        Children are queued only while the walk still has room under
+        ``max_directories``. The file cap stops the read immediately.
+        """
+
+        slots = max(0, self.limits.max_directories - self.entered - len(pending))
+        queued = 0
+        iterator = os.scandir(fd)
+        try:
+            for entry in iterator:
+                if self.stopped is not None:
+                    break
+                name = entry.name
+                if name in {"", ".", ".."}:
+                    continue
+                child = name if rel == "" else f"{rel}/{_nfc(name)}"
+                child = _nfc(child)
+                try:
+                    info = os.lstat(name, dir_fd=fd)
+                except OSError:
+                    self.limitations.append(f"unreadable path: {child}")
+                    continue
+                if stat.S_ISLNK(info.st_mode):
+                    self._symlink(node, name, child, fd)
+                    if self.stopped is not None:
+                        break
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    queued = self._queue_directory(
+                        node,
+                        name,
+                        child,
+                        depth,
+                        info,
+                        dotnet_parent,
+                        pending,
+                        slots,
+                        queued,
+                    )
+                    continue
+                if not self._accept_file():
+                    break
+                if stat.S_ISREG(info.st_mode):
+                    node.names[name] = "file"
+        finally:
+            iterator.close()
+
+    def _queue_directory(
+        self,
+        node: _Node,
+        name: str,
+        child: str,
+        depth: int,
+        info: os.stat_result,
+        dotnet_parent: bool,
+        pending: deque[tuple[str, int, tuple[int, int]]],
+        slots: int,
+        queued: int,
+    ) -> int:
+        """Queue one real child, or remember a marker directory and move on."""
+
+        skipped = name in _SKIP_DIRS or (name in {"bin", "obj"} and dotnet_parent)
+        if skipped or depth >= _MAX_DEPTH:
+            if not skipped and depth >= _MAX_DEPTH:
+                self._note_depth()
+            if name in _MARKER_DIRS:
+                node.names[name] = "dir"
+            return queued
+        if queued < slots:
+            pending.append((child, depth + 1, (info.st_dev, info.st_ino)))
+            node.names[name] = "dir"
+            return queued + 1
+        self._directory_overflow = True
+        if name in _MARKER_DIRS:
+            node.names[name] = "dir"
+        return queued
 
     def _directory_failure(self, rel: str, reason: str, cause: BaseException | None = None) -> None:
         if rel == "" or reason == "mismatch-root":
@@ -351,7 +422,6 @@ class _Walker:
     def _symlink(self, node: _Node, name: str, child: str, dir_fd: int) -> None:
         kind = classify_symlink(self.root, child)
         if kind == "inside-dir":
-            node.names[name] = "dir-symlink"
             return
         if kind == "inside-file":
             if self._accept_file():
@@ -362,10 +432,8 @@ class _Walker:
         else:
             self._note_link_issue(child, kind)
         if _points_at_directory(name, dir_fd):
-            node.names[name] = "outside-symlink"
             return
-        if self._accept_file():
-            node.names[name] = "outside-symlink"
+        self._accept_file()
 
     def _note_link_issue(self, relative: str, kind: str) -> None:
         if relative in self._symlink_seen:
@@ -405,25 +473,29 @@ class _Walker:
         )
 
 
-def _list_fd(fd: int) -> list[os.DirEntry[str]]:
+def _directory_has_dotnet_project(fd: int) -> bool:
+    """Return whether this directory contains a .NET project file.
+
+    The scan does not keep the names from this pass. ``bin`` and ``obj`` are
+    decided only after the boolean is known, because those directories may
+    be listed first.
+    """
+
     iterator = os.scandir(fd)
     try:
-        return list(iterator)
+        for entry in iterator:
+            name = entry.name
+            if not name.endswith((".csproj", ".sln")):
+                continue
+            try:
+                info = os.lstat(name, dir_fd=fd)
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                return True
+        return False
     finally:
         iterator.close()
-
-
-def _has_dotnet_project(entries: list[os.DirEntry[str]], dir_fd: int) -> bool:
-    for entry in entries:
-        if not (entry.name.endswith(".csproj") or entry.name.endswith(".sln")):
-            continue
-        try:
-            info = os.lstat(entry.name, dir_fd=dir_fd)
-        except OSError:
-            continue
-        if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-            return True
-    return False
 
 
 def _points_at_directory(name: str, dir_fd: int) -> bool:
