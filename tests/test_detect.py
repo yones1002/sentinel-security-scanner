@@ -6,6 +6,8 @@ import ast
 import errno
 import os
 import stat
+import sys
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,8 @@ from sentinel.config import (
     load_scan_config,
 )
 from sentinel.detect import (
+    _SYMLINK_LINES,
+    _Walker,
     apply_external_components,
     assign_component_id,
     assign_endpoint_component,
@@ -474,6 +478,70 @@ def test_outside_file_symlinks_are_capped_at_twenty_lines(tmp_path: Path) -> Non
     assert SECRET.decode() not in blob
     assert str(secret) not in blob
     assert str(outside) not in blob
+
+
+def test_outside_symlink_retention_matches_the_reported_lines(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Outside symlink paths stay bounded by the 20 reported lines.
+
+    Link-issue lines are still one per path. The public count line stays
+    ``skipped symlink outside target: N more``.
+    """
+
+    count = 2_000
+    synthetic = _Walker(tmp_path, DetectLimits())
+    for index in range(count):
+        synthetic.note_symlink(f"s{index:05d}")
+    synthetic.note_symlink("s00000")
+    assert synthetic.symlink_total == count
+    assert len(synthetic._symlink_seen) == _SYMLINK_LINES
+    assert synthetic.limitations == [
+        f"skipped symlink outside target: s{index:05d}" for index in range(_SYMLINK_LINES)
+    ]
+    retained = sys.getsizeof(synthetic._symlink_seen) + sum(
+        sys.getsizeof(path) for path in synthetic._symlink_seen
+    )
+    unbounded = sys.getsizeof("s00000") * count
+    assert retained * 5 < unbounded
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "scan"
+    root.mkdir()
+    names = [f"l{index:05d}" for index in range(count)]
+    broken = ("broken-a", "broken-b")
+    for name in names:
+        (root / name).symlink_to(outside, target_is_directory=True)
+    for name in broken:
+        (root / name).symlink_to(f"missing-{name}")
+    root_id = (root.stat().st_dev, root.stat().st_ino)
+    order = [*names, *broken]
+    real_scandir = os.scandir
+    holders: list[_Walker] = []
+    original_init = _Walker.__init__
+
+    def capture(self: _Walker, walked: Path, limits: DetectLimits) -> None:
+        original_init(self, walked, limits)
+        holders.append(self)
+
+    def fake(path: object) -> object:
+        if isinstance(path, int) and (os.fstat(path).st_dev, os.fstat(path).st_ino) == root_id:
+            return _Listing(order)
+        return real_scandir(path)
+
+    monkeypatch.setattr(_Walker, "__init__", capture)
+    monkeypatch.setattr(os, "scandir", fake)
+    found = detect(root)
+    assert len(holders) == 1
+    walker = holders[0]
+    assert walker.symlink_total == count
+    assert walker._symlink_seen == set(names[:_SYMLINK_LINES]) | set(broken)
+    assert found.limitations == (
+        *(f"skipped symlink outside target: {name}" for name in names[:_SYMLINK_LINES]),
+        *(f"skipped broken symlink: {name}" for name in broken),
+        f"skipped symlink outside target: {count - _SYMLINK_LINES} more",
+    )
 
 
 def test_file_cap_records_one_limitation(tmp_path: Path) -> None:
@@ -1190,6 +1258,192 @@ def test_config_rejects_oversized_and_symlink_policy(tmp_path: Path) -> None:
     outside_huge.write_bytes(huge)
     with pytest.raises(UsageError, match="config file exceeds size limit"):
         load_scan_config(outside_huge, target=root)
+
+
+class _Listing:
+    """Directory iterator with the ``close`` method ``os.scandir`` provides."""
+
+    def __init__(self, names: list[str]) -> None:
+        self._names = iter(names)
+
+    def __iter__(self) -> _Listing:
+        return self
+
+    def __next__(self) -> _Named:
+        return _Named(next(self._names))
+
+    def close(self) -> None:
+        self._names = iter(())
+
+
+class _Named:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _LiveEntry:
+    """One synthetic directory entry. Instances must not accumulate."""
+
+    live = 0
+    peak = 0
+    created = 0
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        type(self).live += 1
+        type(self).created += 1
+        type(self).peak = max(type(self).peak, type(self).live)
+
+    def __del__(self) -> None:
+        type(self).live -= 1
+
+
+class _LiveListing:
+    def __init__(self, names: list[tuple[str, str]]) -> None:
+        self._names = iter(names)
+
+    def __iter__(self) -> _LiveListing:
+        return self
+
+    def __next__(self) -> _LiveEntry:
+        name, _kind = next(self._names)
+        return _LiveEntry(name)
+
+    def close(self) -> None:
+        self._names = iter(())
+
+
+def test_wordpress_markers_remain_visible_at_the_directory_cap(tmp_path: Path) -> None:
+    root = tmp_path / "wp"
+    (root / "wp-includes").mkdir(parents=True)
+    (root / "wp-content").mkdir()
+    (root / "wp-config.php").write_text("<?php\n", encoding="utf-8")
+    found = detect(root, DetectLimits(max_files=50, max_directories=1))
+    component = found.components[0]
+    assert component.frameworks == (Framework.WORDPRESS,)
+    assert component.evidence == ("wp-config.php", "wp-includes", "wp-content")
+    assert found.limitations == (
+        "detection stopped: directory cap 1 reached; results are incomplete",
+    )
+
+
+def test_dotnet_skip_uses_a_project_file_listed_after_bin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "web"
+    root.mkdir()
+    (root / "App.csproj").write_text("<Project></Project>\n", encoding="utf-8")
+    (root / "bin").mkdir()
+    (root / "obj").mkdir()
+    (root / "bin" / "go.mod").write_text("module should.skip\n\ngo 1.22\n", encoding="utf-8")
+    (root / "obj" / "go.mod").write_text("module should.skip.obj\n\ngo 1.22\n", encoding="utf-8")
+    root_id = (root.stat().st_dev, root.stat().st_ino)
+    real_scandir = os.scandir
+
+    def fake(path: object) -> object:
+        iterator = real_scandir(path)
+        try:
+            names = [item.name for item in iterator]
+        finally:
+            iterator.close()
+        if isinstance(path, int) and (os.fstat(path).st_dev, os.fstat(path).st_ino) == root_id:
+            rank = {"bin": 0, "obj": 1}
+            names = sorted(names, key=lambda name: (rank.get(name, 2), name))
+        return _Listing(names)
+
+    monkeypatch.setattr(os, "scandir", fake)
+    found = detect(root)
+    ids = {component.component_id for component in found.components}
+    assert "bin" not in ids
+    assert "obj" not in ids
+    assert "should.skip" not in repr(found)
+    assert found.components[0].languages == (Language.CSHARP,)
+
+
+def test_wide_directory_retention_tracks_the_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Retained names follow the budgets, not the number of directory entries."""
+
+    directory_count = 10_000
+    file_count = 100_000
+    file_budget = 5
+    directory_budget = 3
+    root = tmp_path / "wide"
+    root.mkdir()
+    directory_names = [f"d{index:05d}" for index in range(directory_count - 1, -1, -1)]
+    file_names = [f"f{index:06d}.txt" for index in range(file_count - 1, -1, -1)]
+    catalog = [(name, "dir") for name in directory_names] + [
+        (name, "file") for name in file_names
+    ]
+    file_stat = os.stat_result((stat.S_IFREG | 0o644, 1, 1, 1, 0, 0, 1, 0, 0, 0))
+    dir_stat = os.stat_result((stat.S_IFDIR | 0o755, 2, 1, 1, 0, 0, 0, 0, 0, 0))
+    real_lstat = os.lstat
+    kept: list[tuple[str, str]] = []
+    pending_peak = {"value": 0}
+
+    class _RememberingDict(dict[str, str]):
+        def __setitem__(self, key: str, value: str) -> None:
+            super().__setitem__(key, value)
+            kept.append((key, value))
+
+    class _PeakDeque(deque):
+        def __init__(self, iterable: object = ()) -> None:
+            super().__init__(iterable)
+            pending_peak["value"] = max(pending_peak["value"], len(self))
+
+        def append(self, item: object) -> None:
+            super().append(item)
+            pending_peak["value"] = max(pending_peak["value"], len(self))
+
+    import sentinel.detect as detect_module
+
+    original_node = detect_module._Node
+
+    def remembering(rel: str) -> object:
+        node = original_node(rel)
+        node.names = _RememberingDict()
+        return node
+
+    def fake_scandir(_path: object) -> _LiveListing:
+        return _LiveListing(catalog)
+
+    def fake_lstat(path: object, *, dir_fd: int | None = None) -> os.stat_result:
+        if dir_fd is None:
+            return real_lstat(path)
+        name = path if isinstance(path, str) else os.fsdecode(path)
+        if name.startswith("d"):
+            return dir_stat
+        return file_stat
+
+    _LiveEntry.live = 0
+    _LiveEntry.peak = 0
+    _LiveEntry.created = 0
+    monkeypatch.setattr(detect_module, "_Node", remembering)
+    monkeypatch.setattr(detect_module, "deque", _PeakDeque)
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+    found = detect(root, DetectLimits(max_files=file_budget, max_directories=directory_budget))
+    assert found.limitations == (
+        "detection stopped: file cap 5 reached; results are incomplete",
+    )
+    assert found.nested_unreadable is False
+    assert kept == [
+        ("d09999", "dir"),
+        ("d09998", "dir"),
+        ("f099999.txt", "file"),
+        ("f099998.txt", "file"),
+        ("f099997.txt", "file"),
+        ("f099996.txt", "file"),
+        ("f099995.txt", "file"),
+    ]
+    assert "d00000" not in {name for name, _kind in kept}
+    assert "f000000.txt" not in {name for name, _kind in kept}
+    assert len(kept) <= file_budget + directory_budget
+    assert pending_peak["value"] <= directory_budget
+    assert _LiveEntry.peak <= 8
+    # One full pass records the .NET flag. The second pass stops at the file cap.
+    assert _LiveEntry.created == len(catalog) + directory_count + file_budget + 1
 
 
 def _by_id_tuple(components):

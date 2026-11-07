@@ -1,9 +1,9 @@
 """Explicit scanner registration.
 
-Milestone 1 does not read entry points. Surface, Semgrep, and the renderers
-are registered by later pull requests. ``builtin_scanners`` still applies the
-timeout ceiling so a later registration cannot skip it. The engine does not
-clamp a timeout that reaches ``run_scan`` directly.
+Milestone 1 does not read entry points. Surface is registered here.
+Semgrep and the renderers are later pull requests. ``builtin_scanners``
+still applies the timeout ceiling so a later registration cannot skip it.
+The engine does not clamp a timeout that reaches ``run_scan`` directly.
 """
 
 from __future__ import annotations
@@ -12,14 +12,15 @@ from collections.abc import Sequence
 
 from sentinel.errors import UsageError
 from sentinel.protocols import ReportRenderer, Scanner
+from sentinel.scanners.surface import SurfaceScanner
 
 _STATIC_TIMEOUT_S = 600
 _DYNAMIC_TIMEOUT_S = 180
 
 
 def builtin_scanners() -> tuple[Scanner, ...]:
-    """Return the scanners this build runs. PR 5 registers none."""
-    selected: tuple[Scanner, ...] = ()
+    """Return the scanners this build runs. Semgrep is a later pull request."""
+    selected: tuple[Scanner, ...] = (SurfaceScanner(),)
     enforce_registration(selected)
     return selected
 
