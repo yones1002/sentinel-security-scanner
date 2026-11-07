@@ -6,6 +6,7 @@ import ast
 import errno
 import os
 import stat
+import sys
 from collections import deque
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from sentinel.config import (
     load_scan_config,
 )
 from sentinel.detect import (
+    _SYMLINK_LINES,
+    _Walker,
     apply_external_components,
     assign_component_id,
     assign_endpoint_component,
@@ -475,6 +478,70 @@ def test_outside_file_symlinks_are_capped_at_twenty_lines(tmp_path: Path) -> Non
     assert SECRET.decode() not in blob
     assert str(secret) not in blob
     assert str(outside) not in blob
+
+
+def test_outside_symlink_retention_matches_the_reported_lines(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Outside symlink paths stay bounded by the 20 reported lines.
+
+    Link-issue lines are still one per path. The public count line stays
+    ``skipped symlink outside target: N more``.
+    """
+
+    count = 2_000
+    synthetic = _Walker(tmp_path, DetectLimits())
+    for index in range(count):
+        synthetic.note_symlink(f"s{index:05d}")
+    synthetic.note_symlink("s00000")
+    assert synthetic.symlink_total == count
+    assert len(synthetic._symlink_seen) == _SYMLINK_LINES
+    assert synthetic.limitations == [
+        f"skipped symlink outside target: s{index:05d}" for index in range(_SYMLINK_LINES)
+    ]
+    retained = sys.getsizeof(synthetic._symlink_seen) + sum(
+        sys.getsizeof(path) for path in synthetic._symlink_seen
+    )
+    unbounded = sys.getsizeof("s00000") * count
+    assert retained * 5 < unbounded
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "scan"
+    root.mkdir()
+    names = [f"l{index:05d}" for index in range(count)]
+    broken = ("broken-a", "broken-b")
+    for name in names:
+        (root / name).symlink_to(outside, target_is_directory=True)
+    for name in broken:
+        (root / name).symlink_to(f"missing-{name}")
+    root_id = (root.stat().st_dev, root.stat().st_ino)
+    order = [*names, *broken]
+    real_scandir = os.scandir
+    holders: list[_Walker] = []
+    original_init = _Walker.__init__
+
+    def capture(self: _Walker, walked: Path, limits: DetectLimits) -> None:
+        original_init(self, walked, limits)
+        holders.append(self)
+
+    def fake(path: object) -> object:
+        if isinstance(path, int) and (os.fstat(path).st_dev, os.fstat(path).st_ino) == root_id:
+            return _Listing(order)
+        return real_scandir(path)
+
+    monkeypatch.setattr(_Walker, "__init__", capture)
+    monkeypatch.setattr(os, "scandir", fake)
+    found = detect(root)
+    assert len(holders) == 1
+    walker = holders[0]
+    assert walker.symlink_total == count
+    assert walker._symlink_seen == set(names[:_SYMLINK_LINES]) | set(broken)
+    assert found.limitations == (
+        *(f"skipped symlink outside target: {name}" for name in names[:_SYMLINK_LINES]),
+        *(f"skipped broken symlink: {name}" for name in broken),
+        f"skipped symlink outside target: {count - _SYMLINK_LINES} more",
+    )
 
 
 def test_file_cap_records_one_limitation(tmp_path: Path) -> None:

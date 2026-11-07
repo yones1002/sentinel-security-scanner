@@ -395,11 +395,18 @@ class _Walker:
         self.nested_unreadable = True
 
     def note_symlink(self, relative: str) -> None:
+        """Count one outside symlink and retain only a reported path.
+
+        The report lists the first 20 paths, then a count. A later path is
+        counted and not stored. ``_note_link_issue`` still records every path
+        whose own line is emitted.
+        """
+
         if relative in self._symlink_seen:
             return
-        self._symlink_seen.add(relative)
         self.symlink_total += 1
         if self.symlink_total <= _SYMLINK_LINES:
+            self._symlink_seen.add(relative)
             self.limitations.append(f"skipped symlink outside target: {relative}")
 
     def read_manifest(self, relative: str) -> bytes | None:
