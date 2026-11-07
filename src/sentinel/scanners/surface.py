@@ -132,6 +132,7 @@ class _Walk:
         self.limits = limits
         self.findings: list[Finding] = []
         self.limitations: list[str] = []
+        self._noted: set[str] = set()
         self.files_seen = 0
         self.entered = 0
         self.stopped: str | None = None
@@ -139,7 +140,7 @@ class _Walk:
         self.posix = _platform_is_posix()
         self.directory_overflow = False
         if not self.posix:
-            self.limitations.append(_POSIX_SKIP)
+            self._append_limitation(_POSIX_SKIP)
 
     def take_file(self) -> bool:
         if self.files_seen >= self.limits.max_files:
@@ -153,12 +154,12 @@ class _Walk:
             return
         self.stopped = kind
         if kind == "file":
-            self.limitations.append(
+            self._append_limitation(
                 f"detection stopped: file cap {self.limits.max_files} reached; "
                 "results are incomplete"
             )
             return
-        self.limitations.append(
+        self._append_limitation(
             f"detection stopped: directory cap {self.limits.max_directories} reached; "
             "results are incomplete"
         )
@@ -167,13 +168,19 @@ class _Walk:
         if self.depth_noted:
             return
         self.depth_noted = True
-        self.limitations.append(
+        self._append_limitation(
             "detection did not descend below depth 8; deeper paths were not scanned"
         )
 
     def note(self, text: str) -> None:
-        if text and text not in self.limitations:
-            self.limitations.append(text)
+        if text and text not in self._noted:
+            self._append_limitation(text)
+
+    def _append_limitation(self, text: str) -> None:
+        """Append one limitation and remember it for a constant-time repeat check."""
+
+        self._noted.add(text)
+        self.limitations.append(text)
 
 
 def _walk(root: Path, limits: DetectLimits) -> tuple[list[Finding], list[str]]:

@@ -27,7 +27,13 @@ from sentinel.recommendations import (
 )
 from sentinel.registry import builtin_scanners, renderers
 from sentinel.sandbox.unavailable import UnavailableDynamicRuntime
-from sentinel.scanners.surface import SKIP_DIRECTORY_NAMES, SurfaceScanner, _plan_entries, _walk
+from sentinel.scanners.surface import (
+    SKIP_DIRECTORY_NAMES,
+    SurfaceScanner,
+    _plan_entries,
+    _Walk,
+    _walk,
+)
 
 CANARY = "CANARY_SHOULD_NOT_APPEAR_IN_REPORT"
 ENV = "sentinel.surface.env-file"
@@ -765,3 +771,20 @@ def test_walk_retains_live_entries_for_the_budget_only(
     ]
     assert _SurfaceEntry.created == total
     assert _SurfaceEntry.peak <= 8
+
+
+def test_note_keeps_first_seen_order_and_drops_duplicates(tmp_path: Path) -> None:
+    """Repeated limitations stay a single line, in the order first recorded."""
+
+    state = _Walk(tmp_path, DetectLimits())
+    depth = "detection did not descend below depth 8; deeper paths were not scanned"
+    state.note_depth()
+    state.note(depth)
+    first = [f"unreadable path: n{index:04d}" for index in range(300)]
+    symlink = "skipped symlink outside target: link"
+    for text in (*first, symlink, "unreadable path: n0000", "", *reversed(first), depth, symlink):
+        state.note(text)
+    assert state.limitations == [depth, *first, symlink]
+    assert state.limitations.count(depth) == 1
+    assert state.limitations.count("unreadable path: n0000") == 1
+    assert state.limitations.count(symlink) == 1
