@@ -10,6 +10,9 @@ from pathlib import Path
 
 import pytest
 
+from sentinel.config import Authorization, load_scan_config
+from sentinel.engine import run_scan
+from sentinel.errors import UsageError
 from sentinel.models import (
     ChangedFinding,
     Comparison,
@@ -30,8 +33,11 @@ from sentinel.models import (
     Severity,
     SkippedScanner,
 )
+from sentinel.protocols import ReportRenderer, ScanContext, ScanMode
+from sentinel.registry import builtin_scanners, enforce_renderer_ids, renderers
 from sentinel.reports.json_report import JsonReportRenderer
 from sentinel.reports.markdown_report import MarkdownReportRenderer
+from sentinel.sandbox.unavailable import UnavailableDynamicRuntime
 
 HOST_MARKER = "HOST-MARKER-SHOULD-NOT-APPEAR"
 ABSOLUTE_TARGET = "/var/sentinel-target/app"
@@ -357,9 +363,8 @@ def test_markdown_uses_stored_totals_and_both_failed_rows() -> None:
     limitations = rendered.split("## Limitations", 1)[1].split("## Dynamic requests", 1)[0]
     assert "None." in limitations
     assert "file cap" not in limitations
-    numbered = report.model_copy(
-        update={"findings": [_finding().model_copy(update={"location": Location(path="a", line=4)})]}
-    )
+    located = _finding().model_copy(update={"location": Location(path="a", line=4)})
+    numbered = report.model_copy(update={"findings": [located]})
     assert "Line: 4" in MarkdownReportRenderer().render(numbered)
     assert "## Comparison" not in rendered
 
@@ -469,3 +474,54 @@ def test_markdown_keeps_untrusted_text_inside_code() -> None:
         assert all(line != fence for line in snippet.split("\n"))
     assert "text/plain" in rendered
     assert "/health" in rendered
+
+
+def test_duplicate_renderer_format_id_is_rejected() -> None:
+    class _Same:
+        format_id = "json"
+
+        def render(self, report: ScanReport, compare: Comparison | None = None) -> str:
+            return ""
+
+    with pytest.raises(UsageError, match="duplicate renderer format_id"):
+        enforce_renderer_ids((_Same(), _Same()))
+
+
+def test_registered_renderers_echo_the_engine_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SENTINEL_HOST_MARKER", HOST_MARKER)
+    target = tmp_path / "scan-target-dir"
+    work = tmp_path / "work-dir-marker-9f3a"
+    target.mkdir()
+    work.mkdir()
+    canary = "CANARY-ENV-BODY-9f3a-SHOULD-NOT-APPEAR"
+    (target / ".env").write_text(canary + "\n", encoding="utf-8")
+    loaded = load_scan_config(None, target=target, attested=True)
+    ctx = ScanContext(
+        scan_id=str(uuid.uuid4()),
+        mode=ScanMode.STATIC,
+        target=target,
+        url=None,
+        url_host=None,
+        pinned_address=None,
+        started_at=datetime.now(UTC),
+        components=(),
+        config=loaded.config,
+        authorization=Authorization(attested=True),
+        work_dir=work,
+    )
+    report = run_scan(ctx, builtin_scanners(), dynamic=UnavailableDynamicRuntime(), store=None)
+    assert report.target == str(ctx.target)
+    assert any(item.evidence.rule_id == "sentinel.surface.env-file" for item in report.findings)
+    selected = renderers()
+    assert [item.format_id for item in selected] == ["json", "markdown"]
+    assert all(isinstance(item, ReportRenderer) for item in selected)
+    for renderer in selected:
+        text = renderer.render(report)
+        assert report.target in text
+        assert str(work) not in text
+        assert canary not in text
+        assert os.getcwd() not in text
+        assert HOST_MARKER not in text
