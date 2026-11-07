@@ -7,12 +7,14 @@ Content is read only for the three literal rules, and only through
 
 from __future__ import annotations
 
+import heapq
 import os
 import stat
 import unicodedata
 import uuid
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 from sentinel import __version__
@@ -135,6 +137,7 @@ class _Walk:
         self.stopped: str | None = None
         self.depth_noted = False
         self.posix = _platform_is_posix()
+        self.directory_overflow = False
         if not self.posix:
             self.limitations.append(_POSIX_SKIP)
 
@@ -195,62 +198,314 @@ def _walk(root: Path, limits: DetectLimits) -> tuple[list[Finding], list[str]]:
             _directory_failure(state, rel, reason)
             continue
         try:
-            entries = _list(fd)
-            dotnet = _dotnet_parent(entries)
-            for entry in entries:
-                if state.stopped is not None:
-                    break
-                _entry(state, fd, rel, depth, entry, dotnet=dotnet, pending=pending)
+            file_budget = state.limits.max_files - state.files_seen
+            dir_slots = state.limits.max_directories - state.entered - len(pending)
+            plan = _plan_directory(
+                fd,
+                file_budget=file_budget,
+                dir_slots=max(0, dir_slots),
+                depth=depth,
+            )
+            _apply_plan(state, fd, rel, depth, plan, pending)
         finally:
             os.close(fd)
+    if state.stopped is None and state.directory_overflow:
+        state._stop("directory")
     return state.findings, state.limitations
 
 
-def _list(fd: int) -> list[os.DirEntry[str]]:
+class _HeapName:
+    """Max-heap entry. The largest name sorts first so the budget can drop it."""
+
+    __slots__ = ("kind", "name")
+
+    def __init__(self, name: str, kind: str) -> None:
+        self.name = name
+        self.kind = kind
+
+    def __lt__(self, other: _HeapName) -> bool:
+        return self.name > other.name
+
+
+@dataclass(frozen=True)
+class _DirectoryPlan:
+    """Bounded selection for one directory, in alphabetical order."""
+
+    seen: int
+    dotnet: bool
+    files: tuple[tuple[str, str], ...]
+    file_overflow: bool
+    dirs: tuple[str, ...]
+    directory_overflow: bool
+    git_dir: bool
+    deep_name: str | None
+    unreadable: tuple[str, ...]
+
+    @property
+    def retained_entries(self) -> int:
+        """Names retained from the directory, including reported unreadable paths."""
+
+        return (
+            len(self.files)
+            + len(self.dirs)
+            + len(self.unreadable)
+            + int(self.file_overflow)
+            + int(self.git_dir)
+            + int(self.deep_name is not None)
+        )
+
+
+def _plan_directory(
+    fd: int,
+    *,
+    file_budget: int,
+    dir_slots: int,
+    depth: int,
+) -> _DirectoryPlan:
+    def lstat_dir(name: str) -> str:
+        try:
+            info = os.lstat(name, dir_fd=fd)
+        except OSError:
+            return "unreadable"
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return "skip"
+        return "ok"
+
     iterator = os.scandir(fd)
     try:
-        return sorted(iterator, key=lambda item: item.name)
+        return _plan_entries(
+            _entry_kinds(iterator),
+            file_budget=file_budget,
+            dir_slots=dir_slots,
+            depth=depth,
+            lstat_dir=lstat_dir,
+        )
     finally:
         iterator.close()
 
 
-def _dotnet_parent(entries: Sequence[os.DirEntry[str]]) -> bool:
-    for entry in entries:
-        if not (entry.name.endswith(".csproj") or entry.name.endswith(".sln")):
-            continue
+def _entry_kinds(iterator: Iterator[os.DirEntry[str]]) -> Iterator[tuple[str, str]]:
+    for entry in iterator:
+        name = entry.name
         try:
-            if entry.is_symlink() or entry.is_file(follow_symlinks=False):
-                return True
+            if entry.is_symlink():
+                kind = "symlink"
+            elif entry.is_dir(follow_symlinks=False):
+                kind = "dir"
+            elif entry.is_file(follow_symlinks=False):
+                kind = "file"
+            else:
+                kind = "other"
         except OSError:
+            kind = "unreadable"
+        yield name, kind
+
+
+def _plan_entries(
+    entries: Iterable[tuple[str, str]],
+    *,
+    file_budget: int,
+    dir_slots: int,
+    depth: int,
+    lstat_dir: Callable[[str], str] | None = None,
+) -> _DirectoryPlan:
+    """Select a directory budget without retaining every name.
+
+    Alphabetical order needs one look at each name. The kept names are at
+    most the file budget, one cutoff name, and the directory slots.
+    """
+
+    check_dir = lstat_dir if lstat_dir is not None else _directory_stat_ok
+    budget = max(0, file_budget)
+    slots = max(0, dir_slots)
+    files: list[_HeapName] = []
+    file_count = 0
+    dirs: list[_HeapName] = []
+    eligible = 0
+    side: list[tuple[str, bool]] = []
+    unreadable: list[str] = []
+    dotnet = False
+    git_dir = False
+    deep_name: str | None = None
+    seen = 0
+    for name, kind in entries:
+        seen += 1
+        if name in {"", ".", ".."}:
             continue
-    return False
+        if kind == "unreadable":
+            unreadable.append(name)
+            continue
+        if kind in {"file", "symlink"}:
+            file_count += 1
+            if name.endswith((".csproj", ".sln")):
+                dotnet = True
+            _offer(files, budget + 1, _HeapName(name, kind))
+            continue
+        if kind != "dir":
+            continue
+        if name == ".git":
+            git_dir = True
+            continue
+        if name in SKIP_DIRECTORY_NAMES:
+            continue
+        if name in {"bin", "obj"}:
+            side.append((name, depth >= _MAX_DEPTH))
+            continue
+        if depth >= _MAX_DEPTH:
+            deep_name = _earlier(deep_name, name)
+            continue
+        checked = check_dir(name)
+        if checked == "unreadable":
+            unreadable.append(name)
+            continue
+        if checked != "ok":
+            continue
+        eligible += 1
+        _offer(dirs, slots, _HeapName(name, "dir"))
+    return _finish_plan(
+        seen=seen,
+        budget=budget,
+        slots=slots,
+        files=files,
+        file_count=file_count,
+        dirs=dirs,
+        eligible=eligible,
+        side=side,
+        unreadable=unreadable,
+        dotnet=dotnet,
+        git_dir=git_dir,
+        deep_name=deep_name,
+        check_dir=check_dir,
+    )
 
 
-def _entry(
+def _finish_plan(
+    *,
+    seen: int,
+    budget: int,
+    slots: int,
+    files: list[_HeapName],
+    file_count: int,
+    dirs: list[_HeapName],
+    eligible: int,
+    side: list[tuple[str, bool]],
+    unreadable: list[str],
+    dotnet: bool,
+    git_dir: bool,
+    deep_name: str | None,
+    check_dir: Callable[[str], str],
+) -> _DirectoryPlan:
+    file_overflow = file_count > budget
+    cutoff: str | None = None
+    if file_overflow and files:
+        cutoff = files[0].name
+        chosen = [item for item in files if item.name != cutoff]
+    else:
+        chosen = list(files)
+    chosen.sort(key=lambda item: item.name)
+    kept_files = tuple((item.name, item.kind) for item in chosen)
+    directory_overflow = False
+    queued: list[str] = []
+    if not file_overflow:
+        queued = [item.name for item in dirs]
+        directory_overflow = eligible > slots
+    for name, depth_limited in side:
+        if dotnet:
+            continue
+        if depth_limited:
+            deep_name = _earlier(deep_name, name)
+            continue
+        checked = check_dir(name)
+        if checked == "unreadable":
+            unreadable.append(name)
+            continue
+        if checked != "ok" or file_overflow:
+            continue
+        queued.append(name)
+    if not file_overflow:
+        queued.sort()
+        if len(queued) > slots:
+            directory_overflow = True
+            del queued[slots:]
+    else:
+        queued = []
+    if cutoff is not None:
+        deep_name = deep_name if deep_name is not None and deep_name < cutoff else None
+        git_dir = git_dir and ".git" < cutoff
+        unreadable = [name for name in unreadable if name < cutoff]
+    return _DirectoryPlan(
+        seen=seen,
+        dotnet=dotnet,
+        files=kept_files,
+        file_overflow=file_overflow,
+        dirs=tuple(queued),
+        directory_overflow=directory_overflow,
+        git_dir=git_dir,
+        deep_name=deep_name,
+        unreadable=tuple(sorted(unreadable)),
+    )
+
+
+def _offer(heap: list[_HeapName], limit: int, item: _HeapName) -> None:
+    if limit <= 0:
+        return
+    if len(heap) < limit:
+        heapq.heappush(heap, item)
+        return
+    if item.name < heap[0].name:
+        heapq.heapreplace(heap, item)
+
+
+def _earlier(current: str | None, name: str) -> str:
+    if current is None or name < current:
+        return name
+    return current
+
+
+def _directory_stat_ok(_name: str) -> str:
+    return "ok"
+
+
+def _apply_plan(
     state: _Walk,
     fd: int,
     rel: str,
     depth: int,
-    entry: os.DirEntry[str],
-    *,
-    dotnet: bool,
+    plan: _DirectoryPlan,
     pending: deque[tuple[str, int, tuple[int, int]]],
 ) -> None:
-    name = entry.name
-    if name in {"", ".", ".."}:
-        return
-    child = _child(rel, name)
-    try:
-        if entry.is_symlink():
+    """Replay the bounded selection in alphabetical order."""
+
+    events: list[tuple[str, str, str]] = []
+    for name, kind in plan.files:
+        events.append((name, "file", kind))
+    for name in plan.dirs:
+        events.append((name, "dir", ""))
+    for name in plan.unreadable:
+        events.append((name, "unreadable", ""))
+    if plan.git_dir:
+        events.append((".git", "git", ""))
+    if plan.deep_name is not None:
+        events.append((plan.deep_name, "deep", ""))
+    events.sort()
+    for name, action, kind in events:
+        child = _child(rel, name)
+        if action == "unreadable":
+            state.note(f"unreadable path: {child}")
+        elif action == "deep":
+            state.note_depth()
+        elif action in {"git", "dir"}:
+            _directory(
+                state, fd, rel, depth, name, child, dotnet=plan.dotnet, pending=pending
+            )
+        elif kind == "symlink":
             _symlink(state, fd, rel, name, child)
-            return
-        if entry.is_dir(follow_symlinks=False):
-            _directory(state, fd, rel, depth, name, child, dotnet=dotnet, pending=pending)
-            return
-        if entry.is_file(follow_symlinks=False):
+        else:
             _file(state, fd, rel, name, child)
-    except OSError:
-        state.note(f"unreadable path: {child}")
+    if plan.file_overflow:
+        state._stop("file")
+    elif plan.directory_overflow:
+        state.directory_overflow = True
 
 
 def _symlink(state: _Walk, fd: int, rel: str, name: str, child: str) -> None:

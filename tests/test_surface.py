@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import os
 import shutil
+import tracemalloc
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,7 +27,7 @@ from sentinel.recommendations import (
 )
 from sentinel.registry import builtin_scanners, renderers
 from sentinel.sandbox.unavailable import UnavailableDynamicRuntime
-from sentinel.scanners.surface import SKIP_DIRECTORY_NAMES, SurfaceScanner
+from sentinel.scanners.surface import SKIP_DIRECTORY_NAMES, SurfaceScanner, _plan_entries, _walk
 
 CANARY = "CANARY_SHOULD_NOT_APPEAR_IN_REPORT"
 ENV = "sentinel.surface.env-file"
@@ -586,3 +587,181 @@ def test_surface_ast_does_not_open_files_or_import_tools() -> None:
             assert node.func.id != "open"
         elif isinstance(node, ast.Attribute):
             assert node.attr not in {"read_text", "read_bytes", "stat"}
+
+
+def test_file_cap_does_not_enter_a_child_listed_before_the_cutoff(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write(root, ".env", "visible\n")
+    _write(root, "m/.env", f"{CANARY}=placeholder\n")
+    _write(root, "z.env", f"{CANARY}=placeholder\n")
+    _ctx, report = _scan(root, limits=DetectLimits(max_files=1))
+    assert [item.location.path for item in report.findings] == [".env"]
+    assert "detection stopped: file cap 1 reached; results are incomplete" in report.limitations
+    assert CANARY not in report.model_dump_json()
+
+
+def test_directory_cap_keeps_the_alphabetically_first_child(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    for name in ("c", "a", "b"):
+        _write(root, f"{name}/.env", "visible\n")
+    _ctx, report = _scan(root, limits=DetectLimits(max_directories=2))
+    assert [item.location.path for item in report.findings] == ["a/.env"]
+    assert (
+        "detection stopped: directory cap 2 reached; results are incomplete" in report.limitations
+    )
+
+
+def test_project_file_listed_after_bin_still_skips_output(tmp_path: Path) -> None:
+    root = tmp_path / "dotnet"
+    root.mkdir()
+    _write(root, "z.csproj", "<Project></Project>\n")
+    _write(root, ".env", "visible\n")
+    _write(root, "bin/.env", f"{CANARY}=placeholder\n")
+    _write(root, "obj/.env", f"{CANARY}=placeholder\n")
+    _ctx, report = _scan(root)
+    assert [item.location.path for item in report.findings] == [".env"]
+    assert CANARY not in report.model_dump_json()
+
+
+def test_plan_retains_the_alphabetical_budget_not_the_directory() -> None:
+    """A wide directory keeps a budget-sized selection and still sees every name."""
+
+    width = 100_000
+    file_budget = 5
+    dir_slots = 3
+
+    def stream():
+        for index in range(width - 1, -1, -1):
+            yield f"d{index:06d}", "dir"
+        for index in range(width - 1, -1, -1):
+            yield f"f{index:06d}.txt", "file"
+
+    tracemalloc.start()
+    plan = _plan_entries(stream(), file_budget=file_budget, dir_slots=dir_slots, depth=0)
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert plan.seen == width * 2
+    assert plan.file_overflow is True
+    assert plan.dirs == ()
+    assert plan.files == tuple((f"f{index:06d}.txt", "file") for index in range(file_budget))
+    assert "f000000.txt" in {name for name, _kind in plan.files}
+    assert "f999999.txt" not in {name for name, _kind in plan.files}
+    assert plan.retained_entries <= file_budget + dir_slots + 1
+    assert peak < 1_500_000
+
+    directories = _plan_entries(
+        ((f"d{index:04d}", "dir") for index in range(999, -1, -1)),
+        file_budget=10,
+        dir_slots=dir_slots,
+        depth=0,
+    )
+    assert directories.file_overflow is False
+    assert directories.dirs == ("d0000", "d0001", "d0002")
+    assert directories.directory_overflow is True
+    assert directories.retained_entries <= dir_slots + 1
+
+    dotnet = _plan_entries(
+        (("bin", "dir"), ("obj", "dir"), ("src", "dir"), ("z.csproj", "file")),
+        file_budget=10,
+        dir_slots=5,
+        depth=0,
+    )
+    assert dotnet.dotnet is True
+    assert dotnet.dirs == ("src",)
+
+    first_bin = _plan_entries(
+        (("zzz", "dir"), ("src", "dir"), ("bin", "dir")),
+        file_budget=10,
+        dir_slots=1,
+        depth=0,
+    )
+    assert first_bin.dotnet is False
+    assert first_bin.dirs == ("bin",)
+    assert first_bin.directory_overflow is True
+
+    hidden = _plan_entries(
+        (("m.txt", "file"), ("z.txt", "file"), ("a", "dir")),
+        file_budget=1,
+        dir_slots=5,
+        depth=8,
+    )
+    assert hidden.deep_name == "a"
+    assert hidden.dirs == ()
+    later = _plan_entries(
+        (("a.txt", "file"), ("b.txt", "file"), ("m", "dir")),
+        file_budget=1,
+        dir_slots=5,
+        depth=8,
+    )
+    assert later.deep_name is None
+    assert later.file_overflow is True
+    assert later.files == (("a.txt", "file"),)
+
+
+class _SurfaceEntry:
+    live = 0
+    peak = 0
+    created = 0
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        type(self).live += 1
+        type(self).created += 1
+        type(self).peak = max(type(self).peak, type(self).live)
+
+    def __del__(self) -> None:
+        type(self).live -= 1
+
+    def is_symlink(self) -> bool:
+        return False
+
+    def is_dir(self, follow_symlinks: bool = True) -> bool:
+        del follow_symlinks
+        return False
+
+    def is_file(self, follow_symlinks: bool = True) -> bool:
+        del follow_symlinks
+        return True
+
+
+class _SurfaceListing:
+    def __init__(self, total: int) -> None:
+        self._index = total
+
+    def __iter__(self) -> _SurfaceListing:
+        return self
+
+    def __next__(self) -> _SurfaceEntry:
+        if self._index <= 0:
+            raise StopIteration
+        self._index -= 1
+        return _SurfaceEntry(f"n{self._index:06d}.txt")
+
+    def close(self) -> None:
+        self._index = 0
+
+
+def test_walk_retains_live_entries_for_the_budget_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    total = 100_000
+    budget = 4
+    root = tmp_path / "wide"
+    root.mkdir()
+    _SurfaceEntry.live = 0
+    _SurfaceEntry.peak = 0
+    _SurfaceEntry.created = 0
+
+    def fake_scandir(_fd: int) -> _SurfaceListing:
+        return _SurfaceListing(total)
+
+    monkeypatch.setattr("sentinel.scanners.surface.os.scandir", fake_scandir)
+    findings, limitations = _walk(root, DetectLimits(max_files=budget, max_directories=8))
+    assert findings == []
+    assert limitations == [
+        "detection stopped: file cap 4 reached; results are incomplete",
+    ]
+    assert _SurfaceEntry.created == total
+    assert _SurfaceEntry.peak <= 8
