@@ -25,7 +25,14 @@ def test_version_constant_is_three_part_numeric() -> None:
 
 def test_only_version_command_is_registered() -> None:
     click_app = get_command(app)
-    assert sorted(click_app.commands) == ["version"]
+    assert sorted(click_app.commands) == [
+        "detect",
+        "history",
+        "plugins",
+        "report",
+        "scan",
+        "version",
+    ]
 
 
 def test_version_command_prints_package_version() -> None:
