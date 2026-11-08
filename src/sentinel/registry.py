@@ -1,7 +1,7 @@
 """Explicit scanner registration.
 
-Milestone 1 does not read entry points. Surface is registered here.
-Semgrep and the renderers are later pull requests. ``builtin_scanners``
+Milestone 1 does not read entry points. Surface, JSON, and Markdown are
+registered here. Semgrep is a later pull request. ``builtin_scanners``
 still applies the timeout ceiling so a later registration cannot skip it.
 The engine does not clamp a timeout that reaches ``run_scan`` directly.
 """
@@ -12,6 +12,8 @@ from collections.abc import Sequence
 
 from sentinel.errors import UsageError
 from sentinel.protocols import ReportRenderer, Scanner
+from sentinel.reports.json_report import JsonReportRenderer
+from sentinel.reports.markdown_report import MarkdownReportRenderer
 from sentinel.scanners.surface import SurfaceScanner
 
 _STATIC_TIMEOUT_S = 600
@@ -26,8 +28,11 @@ def builtin_scanners() -> tuple[Scanner, ...]:
 
 
 def renderers() -> tuple[ReportRenderer, ...]:
-    """Return report renderers. JSON and Markdown arrive in a later PR."""
-    selected: tuple[ReportRenderer, ...] = ()
+    """Return the JSON renderer and then the Markdown renderer."""
+    selected: tuple[ReportRenderer, ...] = (
+        JsonReportRenderer(),
+        MarkdownReportRenderer(),
+    )
     enforce_renderer_ids(selected)
     return selected
 
