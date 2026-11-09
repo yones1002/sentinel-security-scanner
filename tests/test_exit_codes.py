@@ -299,7 +299,6 @@ def test_missing_path_and_bad_arguments_exit_1(
     assert "unknown fail_on value: weird" in unknown.stderr
     for flag in (
         "--confirm-ambiguous-reads",
-        "--strict-tools",
         "--semgrep-config",
         "--compare",
         "--start-cmd",

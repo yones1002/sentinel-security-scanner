@@ -129,6 +129,7 @@ def scan_command(
     report_format: Annotated[str, typer.Option("--format")] = "markdown",
     output: Annotated[Path | None, typer.Option("--output")] = None,
     fail_on: Annotated[str, typer.Option("--fail-on")] = "none",
+    strict_tools: Annotated[bool, typer.Option("--strict-tools")] = False,
     config: Annotated[Path | None, typer.Option("--config")] = None,
     history: Annotated[bool, typer.Option("--history")] = False,
     authorized: Annotated[bool, typer.Option("--authorized")] = False,
@@ -145,6 +146,7 @@ def scan_command(
             report_format=report_format,
             output=output,
             fail_on=fail_on,
+            strict_tools=strict_tools,
             config=config,
             history=history,
             authorized=authorized,
@@ -268,6 +270,7 @@ def _scan(
     report_format: str,
     output: Path | None,
     fail_on: str,
+    strict_tools: bool,
     config: Path | None,
     history: bool,
     authorized: bool,
@@ -295,6 +298,7 @@ def _scan(
         target=path,
         attested=authorized,
         fail_on=fail_on,
+        strict_tools=strict_tools,
         history=False,
     )
     dynamic_request = dynamic or scan_all or url is not None
@@ -335,6 +339,8 @@ def _scan(
         else:
             output.write_text(rendered, encoding="utf-8")
     if _nested_unreadable(report.limitations):
+        return int(ExitCode.SCAN_FAILURE)
+    if report.strict_failure:
         return int(ExitCode.SCAN_FAILURE)
     if _meets_threshold(report.findings, fail_on):
         return int(ExitCode.THRESHOLD)
