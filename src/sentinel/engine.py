@@ -80,6 +80,7 @@ STRICT_DYNAMIC_SKIP = "dynamic skipped because --strict-tools failed during stat
 HISTORY_UNAVAILABLE = "history store is not in this build (milestone 2)"
 OUTSIDE_TARGET_REASON = "tool reported a path outside the target"
 _OUTSIDE_SYMLINK = "skipped symlink outside target"
+_SEMGREPIGNORE_SKIP = "project .semgrepignore could not be disabled"
 _READ_SKIPPED = "read skipped"
 _REQUEST_CLASSES = frozenset({"read_candidate", "ambiguous", "state_changing"})
 _SENT_METHODS = frozenset({"GET", "HEAD"})
@@ -371,6 +372,11 @@ def _run_scanners(
                     failed=probe.failed,
                 )
             )
+            if (
+                probe.reason == _SEMGREPIGNORE_SKIP
+                and _SEMGREPIGNORE_SKIP not in build.limitations
+            ):
+                build.limitations.append(_SEMGREPIGNORE_SKIP)
             if watch_strict and _probe_is_strict(probe):
                 problem = True
             continue

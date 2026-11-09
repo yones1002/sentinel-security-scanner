@@ -1,0 +1,6 @@
+rules:
+  - id: sentinel.fixture.marker
+    languages: [python]
+    severity: INFO
+    message: Fixture marker for the semgrep adapter. Not a security rule.
+    pattern: sentinel_fixture_marker
