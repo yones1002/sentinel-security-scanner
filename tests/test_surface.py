@@ -94,9 +94,9 @@ def test_skip_names_match_the_detector() -> None:
     assert SKIP_DIRECTORY_NAMES == _SKIP_DIRS
 
 
-def test_registry_is_surface_only() -> None:
+def test_registry_lists_surface_and_semgrep() -> None:
     scanners = builtin_scanners()
-    assert [item.name for item in scanners] == ["surface"]
+    assert [item.name for item in scanners] == ["surface", "semgrep"]
     assert [item.format_id for item in renderers()] == ["json", "markdown"]
     scanner = scanners[0]
     assert scanner.version == __version__
@@ -130,6 +130,12 @@ def test_registry_is_surface_only() -> None:
     assert probe.available is True
     assert probe.version == __version__
     assert probe.failed is False
+    semgrep = scanners[1]
+    assert semgrep.version == __version__
+    assert semgrep.rule_pack_version is None
+    assert semgrep.timeout_s == 300
+    assert semgrep.scope.value == "root"
+    assert semgrep.modes == frozenset({"static"})
 
 
 def test_recommendation_rows_have_no_sketches() -> None:

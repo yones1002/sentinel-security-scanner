@@ -913,10 +913,14 @@ def test_registration_ceiling_and_empty_builtins() -> None:
         )
     assert [item.format_id for item in renderers()] == ["json", "markdown"]
     registered = builtin_scanners()
-    assert [item.name for item in registered] == ["surface"]
+    assert [item.name for item in registered] == ["surface", "semgrep"]
     assert registered[0].scope == ScannerScope.ROOT
     assert registered[0].modes == frozenset({"static"})
     assert registered[0].timeout_s == 60
+    assert registered[1].scope == ScannerScope.ROOT
+    assert registered[1].modes == frozenset({"static"})
+    assert registered[1].timeout_s == 300
+    assert registered[1].rule_pack_version is None
     names = [item.name for item in registered]
     assert len(names) == len(set(names))
 
