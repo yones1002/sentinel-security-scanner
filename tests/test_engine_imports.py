@@ -77,6 +77,8 @@ def test_protocols_and_registry_stay_leaves() -> None:
     allowed_scanners = {
         "sentinel.scanners.surface",
         "sentinel.scanners.surface.SurfaceScanner",
+        "sentinel.scanners.semgrep",
+        "sentinel.scanners.semgrep.SemgrepScanner",
     }
     leaked_registry = [
         name
