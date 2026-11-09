@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import socket
 import sys
 from pathlib import Path
@@ -10,11 +11,14 @@ import pytest
 from typer.testing import CliRunner
 
 from sentinel.cli import _nested_unreadable, app, parse_scan_url
+from sentinel.config import DetectLimits
 from sentinel.detect import Detection
 from sentinel.errors import AuthorizationError, UsageError
 from sentinel.fs import open_confined_directory
 from sentinel.models import Component, ComponentKind
+from sentinel.protocols import ProbeResult, ScannerSkip, ScanPluginResult
 from sentinel.sandbox.unavailable import DYNAMIC_UNAVAILABLE
+from sentinel.scanners.semgrep import NO_CONFIG_REASON, NON_JSON_REASON, SEMGREPIGNORE_REASON
 
 runner = CliRunner()
 AUTH = (
@@ -299,7 +303,6 @@ def test_missing_path_and_bad_arguments_exit_1(
     assert "unknown fail_on value: weird" in unknown.stderr
     for flag in (
         "--confirm-ambiguous-reads",
-        "--strict-tools",
         "--semgrep-config",
         "--compare",
         "--start-cmd",
@@ -408,3 +411,250 @@ def test_history_prune_and_cap_limitations() -> None:
     assert not _nested_unreadable(["refused directory symlink: sub"])
     assert _nested_unreadable(["unreadable directory: blocked"])
     assert _nested_unreadable(["permission denied: blocked"])
+
+
+def _load(text: str) -> dict[str, object]:
+    loaded = json.loads(text)
+    assert isinstance(loaded, dict)
+    return loaded
+
+
+def _rows(document: dict[str, object], section: str) -> list[dict[str, object]]:
+    scanners = document["scanners"]
+    assert isinstance(scanners, dict)
+    rows = scanners[section]
+    assert isinstance(rows, list)
+    found: list[dict[str, object]] = []
+    for row in rows:
+        assert isinstance(row, dict)
+        found.append(row)
+    return found
+
+
+def _executed(document: dict[str, object]) -> list[str]:
+    names: list[str] = []
+    for row in _rows(document, "executed"):
+        name = row["name"]
+        assert isinstance(name, str)
+        names.append(name)
+    return names
+
+
+def _skipped(document: dict[str, object]) -> list[tuple[str, str, bool]]:
+    found: list[tuple[str, str, bool]] = []
+    for row in _rows(document, "skipped"):
+        name = row["name"]
+        reason = row["reason"]
+        failed = row["failed"]
+        assert isinstance(name, str)
+        assert isinstance(reason, str)
+        assert isinstance(failed, bool)
+        found.append((name, reason, failed))
+    return found
+
+
+def _install_ready_semgrep(monkeypatch: pytest.MonkeyPatch) -> None:
+    def probe(self: object, ctx: object) -> ProbeResult:
+        del self, ctx
+        return ProbeResult(True, "semgrep 1.2.3", None)
+
+    def scan(self: object, ctx: object, target: object) -> ScanPluginResult:
+        del self, ctx, target
+        return ScanPluginResult(findings=())
+
+    monkeypatch.setattr("sentinel.scanners.semgrep.SemgrepScanner.probe", probe)
+    monkeypatch.setattr("sentinel.scanners.semgrep.SemgrepScanner.scan", scan)
+
+
+def test_missing_semgrep_stays_success_until_strict_tools(tmp_path: Path) -> None:
+    target = tmp_path / "tree"
+    target.mkdir()
+    (target / "app.py").write_text("x = 1\n", encoding="utf-8")
+    plain = runner.invoke(app, ["scan", "--format", "json", str(target)])
+    assert plain.exit_code == 0
+    document = _load(plain.stdout)
+    assert document["strict_failure"] is False
+    assert "semgrep" not in _executed(document)
+    assert ("semgrep", NO_CONFIG_REASON, False) in _skipped(document)
+    assert NO_CONFIG_REASON not in document["limitations"]
+    output = tmp_path / "report.json"
+    strict = runner.invoke(
+        app,
+        [
+            "scan",
+            "--strict-tools",
+            "--format",
+            "json",
+            "--output",
+            str(output),
+            str(target),
+        ],
+    )
+    assert strict.exit_code == 2
+    assert strict.stdout == ""
+    saved = _load(output.read_text(encoding="utf-8"))
+    assert saved["strict_failure"] is True
+    assert "surface" in _executed(saved)
+    assert "semgrep" not in _executed(saved)
+    assert ("semgrep", NO_CONFIG_REASON, False) in _skipped(saved)
+
+
+def test_strict_failure_outranks_the_finding_threshold(tmp_path: Path) -> None:
+    target = tmp_path / "tree"
+    target.mkdir()
+    canary = "CANARY-CLI-SHOULD-NOT-APPEAR"
+    (target / ".env").write_text(canary + "\n", encoding="utf-8")
+    high = runner.invoke(app, ["scan", "--fail-on", "high", "--format", "json", str(target)])
+    assert high.exit_code == 3
+    assert _load(high.stdout)["strict_failure"] is False
+    output = tmp_path / "strict.json"
+    strict = runner.invoke(
+        app,
+        [
+            "scan",
+            "--strict-tools",
+            "--fail-on",
+            "high",
+            "--format",
+            "json",
+            "--output",
+            str(output),
+            str(target),
+        ],
+    )
+    assert strict.exit_code == 2
+    assert strict.stdout == ""
+    text = output.read_text(encoding="utf-8")
+    document = _load(text)
+    assert document["strict_failure"] is True
+    assert canary not in text
+    findings = document["findings"]
+    assert isinstance(findings, list)
+    assert findings
+    evidence = findings[0]["evidence"]
+    assert isinstance(evidence, dict)
+    assert evidence["rule_id"] == "sentinel.surface.env-file"
+
+
+def test_depth_and_file_caps_do_not_set_strict_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_ready_semgrep(monkeypatch)
+    deep = tmp_path / "deep"
+    deep.mkdir()
+    nested = deep.joinpath(*(str(level) for level in range(1, 10)))
+    nested.mkdir(parents=True)
+    (nested / "leaf.txt").write_text("x\n", encoding="utf-8")
+    depth = runner.invoke(app, ["scan", "--strict-tools", "--format", "json", str(deep)])
+    assert depth.exit_code == 0
+    depth_document = _load(depth.stdout)
+    assert depth_document["strict_failure"] is False
+    assert "semgrep" in _executed(depth_document)
+    limitations = depth_document["limitations"]
+    assert isinstance(limitations, list)
+    note = "detection did not descend below depth 8; deeper paths were not scanned"
+    assert note in limitations
+
+    def one_file(*_args: object, **_kwargs: object) -> DetectLimits:
+        return DetectLimits(max_files=1)
+
+    monkeypatch.setattr("sentinel.config.DetectLimits", one_file)
+    capped = tmp_path / "capped"
+    capped.mkdir()
+    (capped / "a.txt").write_text("a\n", encoding="utf-8")
+    (capped / "b.txt").write_text("b\n", encoding="utf-8")
+    files = runner.invoke(app, ["scan", "--strict-tools", "--format", "json", str(capped)])
+    assert files.exit_code == 0
+    file_document = _load(files.stdout)
+    assert file_document["strict_failure"] is False
+    file_limits = file_document["limitations"]
+    assert isinstance(file_limits, list)
+    assert "detection stopped: file cap 1 reached; results are incomplete" in file_limits
+
+
+def test_semgrepignore_skip_exits_2_when_strict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = {"scan": 0}
+
+    def probe(self: object, ctx: object) -> ProbeResult:
+        del self, ctx
+        return ProbeResult(False, None, SEMGREPIGNORE_REASON, failed=False)
+
+    def scan(self: object, ctx: object, target: object) -> ScanPluginResult:
+        del self, ctx, target
+        calls["scan"] += 1
+        raise AssertionError("semgrep scan")
+
+    monkeypatch.setattr("sentinel.scanners.semgrep.SemgrepScanner.probe", probe)
+    monkeypatch.setattr("sentinel.scanners.semgrep.SemgrepScanner.scan", scan)
+    target = tmp_path / "tree"
+    target.mkdir()
+    (target / "app.py").write_text("x = 1\n", encoding="utf-8")
+    plain = runner.invoke(app, ["scan", "--format", "json", str(target)])
+    assert plain.exit_code == 0
+    assert calls["scan"] == 0
+    document = _load(plain.stdout)
+    assert document["strict_failure"] is False
+    assert "semgrep" not in _executed(document)
+    assert ("semgrep", SEMGREPIGNORE_REASON, False) in _skipped(document)
+    limitations = document["limitations"]
+    assert isinstance(limitations, list)
+    assert limitations.count(SEMGREPIGNORE_REASON) == 1
+    strict = runner.invoke(app, ["scan", "--strict-tools", "--format", "json", str(target)])
+    assert strict.exit_code == 2
+    assert calls["scan"] == 0
+    failed = _load(strict.stdout)
+    assert failed["strict_failure"] is True
+    assert "semgrep" not in _executed(failed)
+    assert ("semgrep", SEMGREPIGNORE_REASON, False) in _skipped(failed)
+    strict_limits = failed["limitations"]
+    assert isinstance(strict_limits, list)
+    assert strict_limits.count(SEMGREPIGNORE_REASON) == 1
+
+
+def test_failed_scanner_skip_exits_2_only_when_strict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def probe(self: object, ctx: object) -> ProbeResult:
+        del self, ctx
+        return ProbeResult(True, "semgrep 1.2.3", None)
+
+    def scan(self: object, ctx: object, target: object) -> ScanPluginResult:
+        del self, ctx, target
+        return ScanPluginResult(
+            findings=(),
+            skips=(ScannerSkip("semgrep", NON_JSON_REASON, True),),
+        )
+
+    monkeypatch.setattr("sentinel.scanners.semgrep.SemgrepScanner.probe", probe)
+    monkeypatch.setattr("sentinel.scanners.semgrep.SemgrepScanner.scan", scan)
+    target = tmp_path / "tree"
+    target.mkdir()
+    (target / "app.py").write_text("x = 1\n", encoding="utf-8")
+    plain = runner.invoke(app, ["scan", "--format", "json", str(target)])
+    assert plain.exit_code == 0
+    document = _load(plain.stdout)
+    assert document["strict_failure"] is False
+    assert ("semgrep", NON_JSON_REASON, True) in _skipped(document)
+    strict = runner.invoke(app, ["scan", "--strict-tools", "--format", "json", str(target)])
+    assert strict.exit_code == 2
+    failed = _load(strict.stdout)
+    assert failed["strict_failure"] is True
+    assert ("semgrep", NON_JSON_REASON, True) in _skipped(failed)
+
+
+def test_dynamic_modes_stay_refused_when_strict_tools_is_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _block_network(monkeypatch)
+    _block_scan(monkeypatch)
+    dynamic = runner.invoke(app, ["scan", "--dynamic", "--strict-tools", str(tmp_path)])
+    assert dynamic.exit_code == 4
+    assert AUTH in dynamic.stderr
+    scan_all = runner.invoke(
+        app,
+        ["scan", "--all", "--authorized", "--strict-tools", str(tmp_path)],
+    )
+    assert scan_all.exit_code == 1
+    assert DYNAMIC_UNAVAILABLE in scan_all.stderr
