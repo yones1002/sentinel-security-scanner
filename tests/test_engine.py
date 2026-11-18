@@ -22,7 +22,6 @@ from sentinel.config import (
 from sentinel.detect import Assignment, Detection, assign_component_id
 from sentinel.engine import (
     BANDIT_DISABLED_REASON,
-    HISTORY_UNAVAILABLE,
     OUTSIDE_TARGET_REASON,
     STRICT_DYNAMIC_SKIP,
     RecordedGroup,
@@ -238,9 +237,21 @@ def _detect_as(components: tuple[Component, ...]):
     return fake
 
 
-def _run(ctx: ScanContext, *scanners: FakeScanner, dynamic: object | None = None, store=None):
+def _run(
+    ctx: ScanContext,
+    *scanners: FakeScanner,
+    dynamic: object | None = None,
+    store=None,
+    extra_limitations: tuple[str, ...] = (),
+):
     runtime = dynamic if dynamic is not None else UnavailableDynamicRuntime()
-    return run_scan(ctx, scanners, dynamic=runtime, store=store)
+    return run_scan(
+        ctx,
+        scanners,
+        dynamic=runtime,
+        store=store,
+        extra_limitations=extra_limitations,
+    )
 
 
 def test_static_report_fields_and_context_are_not_mutated(tmp_path: Path) -> None:
@@ -1081,16 +1092,41 @@ def test_confirm_flag_releases_only_ambiguous_get(tmp_path: Path, monkeypatch: p
     assert ("state_changing", "HEAD", "/wipe") in withheld
 
 
-def test_history_store_is_refused_before_detect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    ctx = _context(tmp_path)
+def test_store_persists_the_finished_report(tmp_path: Path) -> None:
+    saved: list[tuple[object, object]] = []
 
-    def explode(target: Path, limits: DetectLimits | None = None) -> Detection:
-        raise AssertionError("detect called")
+    class Store:
+        def save(self, report: object, config: object) -> None:
+            saved.append((report, config))
 
-    monkeypatch.setattr("sentinel.engine.detect", explode)
-    with pytest.raises(UsageError) as caught:
-        _run(ctx, FakeScanner(), store=object())
-    assert str(caught.value) == HISTORY_UNAVAILABLE
+    ctx = _context(tmp_path, config=_config(history=True, fail_on="high"))
+    report = _run(ctx, FakeScanner(), store=Store(), extra_limitations=("config note",))
+    assert saved == [(report, ctx.config)]
+    assert report.limitations[-1] == "config note"
+    assert ctx.config.history is True
+
+
+def test_store_failure_propagates_after_detect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+
+    def detect_called(target: Path, limits: DetectLimits | None = None) -> Detection:
+        del target, limits
+        seen.append("detect")
+        return Detection((), (), False)
+
+    monkeypatch.setattr("sentinel.engine.detect", detect_called)
+
+    class Store:
+        def save(self, report: object, config: object) -> None:
+            del report, config
+            seen.append("save")
+            raise ScanFailure("history database could not be written")
+
+    with pytest.raises(ScanFailure, match="could not be written"):
+        _run(_context(tmp_path), FakeScanner(), store=Store())
+    assert seen == ["detect", "save"]
 
 
 def test_url_mode_does_not_treat_the_component_as_a_repository(

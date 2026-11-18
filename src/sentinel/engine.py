@@ -39,7 +39,7 @@ from sentinel.detect import (
     detect,
     require_unique_components,
 )
-from sentinel.errors import ScannerError, UsageError
+from sentinel.errors import ScanFailure, ScannerError, UsageError
 from sentinel.fingerprint import fingerprint
 from sentinel.fs import open_inside
 from sentinel.models import (
@@ -77,7 +77,6 @@ logger = logging.getLogger(__name__)
 
 BANDIT_DISABLED_REASON = "bandit disabled because semgrep ran"
 STRICT_DYNAMIC_SKIP = "dynamic skipped because --strict-tools failed during static scanning"
-HISTORY_UNAVAILABLE = "history store is not in this build (milestone 2)"
 OUTSIDE_TARGET_REASON = "tool reported a path outside the target"
 _OUTSIDE_SYMLINK = "skipped symlink outside target"
 _SEMGREPIGNORE_SKIP = "project .semgrepignore could not be disabled"
@@ -174,14 +173,15 @@ def run_scan(
     *,
     dynamic: DynamicRuntime,
     store: object | None,
+    extra_limitations: Sequence[str] = (),
 ) -> ScanReport:
     """Run the selected scanners. ``ScannerError`` becomes a failed skip.
 
-    ``UnavailableDynamicRuntime.prepare`` is not caught. A non-None ``store``
-    raises ``UsageError`` because milestone 1 has no history database.
+    When ``store`` is not None, the finished report is persisted before this
+    function returns. ``extra_limitations`` are appended after scanner notes
+    and are included in that stored report. ``UnavailableDynamicRuntime.prepare``
+    is not caught.
     """
-    if store is not None:
-        raise UsageError(HISTORY_UNAVAILABLE)
     started = time.monotonic()
     components, limitations = _components_for(ctx)
     root = _scan_root(components, ctx.target, url_component=_url_only(ctx, components))
@@ -223,8 +223,11 @@ def run_scan(
             watch_strict=False,
         )
     findings = _collapse(build)
+    for note in extra_limitations:
+        if note not in build.limitations:
+            build.limitations.append(note)
     finished_ms = _elapsed_ms(time.monotonic(), _clock_start(build))
-    return _report(
+    report = _report(
         ctx,
         components=components,
         findings=findings,
@@ -232,6 +235,16 @@ def run_scan(
         strict_failure=strict_failure,
         duration_ms=finished_ms,
     )
+    if store is not None:
+        _persist(store, report, ctx.config)
+    return report
+
+
+def _persist(store: object, report: ScanReport, config: object) -> None:
+    save = getattr(store, "save", None)
+    if not callable(save):
+        raise ScanFailure("history database could not be written")
+    save(report, config)
 
 
 @dataclass

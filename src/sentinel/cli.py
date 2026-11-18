@@ -1,7 +1,9 @@
 """Sentinel command line.
 
 Static scans call the engine and the registered renderers. Dynamic mode,
-URL mode, history, and HTML stop here, before any socket.
+URL mode, and HTML stop here, before any socket. ``--history`` stores the
+finished scan. ``report --scan-id`` reads that scan back. History list,
+prune, and compare stay refused.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from sentinel.config import load_scan_config
 from sentinel.detect import apply_external_components, detect
 from sentinel.engine import run_scan
 from sentinel.errors import AuthorizationError, ExitCode, ScanFailure, UsageError
+from sentinel.history.store import open_history
 from sentinel.models import Finding, ScanReport
 from sentinel.protocols import ScanContext, ScanMode
 from sentinel.registry import builtin_scanners, renderers
@@ -68,10 +71,9 @@ _AUTH_REQUIRED = (
     "dynamic scanning requires --authorized; "
     "refusing before any network or container operation"
 )
-_HISTORY_UNAVAILABLE = "history store is not in this build (milestone 2)"
 _HISTORY_MAINTENANCE = "history maintenance is not in this build (milestone 6)"
 _HTML_UNAVAILABLE = "html format is not in this build (milestone 3)"
-_REPORT_UNAVAILABLE = "report is not in this build (milestone 2)"
+_COMPARE_UNAVAILABLE = "compare is not in this build (milestone 3)"
 _URL_USERINFO = "URL must not contain a backslash or userinfo"
 _URL_SCHEME = "URL scheme must be http or https"
 _URL_HOSTNAME = "URL hostname is missing or has a trailing dot"
@@ -162,9 +164,15 @@ def report_command(
     output: Annotated[Path | None, typer.Option("--output")] = None,
     compare: Annotated[str | None, typer.Option("--compare")] = None,
 ) -> None:
-    """Report lookup arrives with the history store."""
-    del scan_id, report_format, output, compare
-    _finish(lambda: (_refuse(_REPORT_UNAVAILABLE)))
+    """Print one stored scan."""
+    _finish(
+        lambda: _show_report(
+            scan_id,
+            report_format=report_format,
+            output=output,
+            compare=compare,
+        )
+    )
 
 
 @history_app.command(name="list")
@@ -299,17 +307,16 @@ def _scan(
         attested=authorized,
         fail_on=fail_on,
         strict_tools=strict_tools,
-        history=False,
+        history=history,
     )
     dynamic_request = dynamic or scan_all or url is not None
     if dynamic_request:
         _refuse_dynamic(url, authorized=authorized, allow_host=allow_host)
-    if history:
-        raise UsageError(_HISTORY_UNAVAILABLE)
     if report_format == "html":
         raise UsageError(_HTML_UNAVAILABLE)
     if path is None:
         raise UsageError("a path or --url is required")
+    history_store = open_history() if history else None
     with tempfile.TemporaryDirectory(prefix="sentinel-work-") as work:
         context = ScanContext(
             scan_id=str(uuid.uuid4()),
@@ -328,11 +335,9 @@ def _scan(
             context,
             builtin_scanners(),
             dynamic=UnavailableDynamicRuntime(),
-            store=None,
+            store=history_store,
+            extra_limitations=loaded.limitations,
         )
-        for note in loaded.limitations:
-            if note not in report.limitations:
-                report.limitations.append(note)
         rendered = _render(report, report_format)
         if output is None:
             typer.echo(rendered, nl=False)
@@ -344,6 +349,30 @@ def _scan(
         return int(ExitCode.SCAN_FAILURE)
     if _meets_threshold(report.findings, fail_on):
         return int(ExitCode.THRESHOLD)
+    return int(ExitCode.SUCCESS)
+
+
+def _show_report(
+    scan_id: str | None,
+    *,
+    report_format: str,
+    output: Path | None,
+    compare: str | None,
+) -> int:
+    if compare is not None:
+        raise UsageError(_COMPARE_UNAVAILABLE)
+    if scan_id is None:
+        raise UsageError("--scan-id is required")
+    if report_format not in _FORMATS:
+        raise UsageError(f"unknown format: {report_format}")
+    if report_format == "html":
+        raise UsageError(_HTML_UNAVAILABLE)
+    report = open_history(create=False).load(scan_id)
+    rendered = _render(report, report_format)
+    if output is None:
+        typer.echo(rendered, nl=False)
+    else:
+        output.write_text(rendered, encoding="utf-8")
     return int(ExitCode.SUCCESS)
 
 
