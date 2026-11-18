@@ -148,19 +148,18 @@ def test_static_scan_writes_markdown_and_json(tmp_path: Path) -> None:
     assert '"scan_id"' in rendered.stdout
 
 
-def test_html_history_and_report_exit_1(
+def test_html_history_maintenance_and_unknown_report_exit_1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _block_scan(monkeypatch)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     html = runner.invoke(app, ["scan", "--format", "html", str(tmp_path)])
     assert html.exit_code == 1
     assert "html format is not in this build (milestone 3)" in html.stderr
-    history = runner.invoke(app, ["scan", "--history", str(tmp_path)])
-    assert history.exit_code == 1
-    assert "history store is not in this build (milestone 2)" in history.stderr
     report = runner.invoke(app, ["report", "--scan-id", "00000000-0000-4000-8000-000000000001"])
     assert report.exit_code == 1
-    assert "report is not in this build (milestone 2)" in report.stderr
+    assert "unknown scan_id: 00000000-0000-4000-8000-000000000001" in report.stderr
+    assert not (tmp_path / "xdg").exists()
     listed = runner.invoke(app, ["history", "list"])
     assert listed.exit_code == 1
     assert "history maintenance is not in this build (milestone 6)" in listed.stderr
